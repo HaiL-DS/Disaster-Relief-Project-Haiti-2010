@@ -1,0 +1,3661 @@
+---
+title: "Project Part 2 - Team 1"
+author: "Virginia Brame, Clay Harris, Hai Liu"
+date: "`r Sys.Date()`"
+output:
+  pdf_document: default
+  word_document: default
+header-includes: \usepackage{float}
+---
+```{r setup}
+knitr::opts_chunk$set(
+  echo = FALSE,
+  cache = TRUE,
+  autodep = TRUE,
+  fig.align = "center",
+  fig.pos = "H",
+  out.width = "100%"
+)
+```
+
+```{r echo true, eval=FALSE}
+# Set eval to TRUE if you want to see the R code outputs
+knitr::opts_chunk$set(
+  echo = TRUE)
+```
+
+## Data (loading, wrangling, EDA) and Feature Engineering (Clay Harris)
+
+```{r parallel}
+#| cache: FALSE
+#| message: FALSE
+library(future)
+plan(multisession, workers = 23)
+```
+
+```{r libraries}
+#| cache: FALSE
+#| warning: FALSE
+#| message: FALSE
+library(tidyverse)
+library(tidymodels)
+library(discrim)
+library(leaflet)
+library(terra)
+library(htmlwidgets)
+library(leafem)
+library(colordistance)
+library(jpeg)
+library(patchwork)
+library(probably)
+library(gridExtra)
+library(plotly)
+library(mapview)
+library(farver)
+library(kableExtra)
+library(leaflet.extras2)
+library(webshot2)
+```
+
+### Data loading and wrangling
+
+```{r holdout data processing}
+#| message: FALSE
+#| warning: FALSE
+
+col_names <- c('ID','X','Y','Map X','Map Y','Lat','Lon','Red','Green','Blue')
+
+blue_files <- c(
+  "orthovnir069_ROI_Blue_Tarps.txt",
+  "orthovnir067_ROI_Blue_Tarps.txt",
+  "orthovnir078_ROI_Blue_Tarps.txt"
+)
+
+non_blue_files <- c(
+  "orthovnir057_ROI_NON_Blue_Tarps.txt",
+  "orthovnir078_ROI_NON_Blue_Tarps.txt",
+  "orthovnir067_ROI_NOT_Blue_Tarps.txt",
+  "orthovnir069_ROI_NOT_Blue_Tarps.txt"
+)
+
+blue_data <- map_dfr(blue_files, ~ 
+  read_table(.x, comment = ";", col_names = col_names, col_types = cols(
+    `Map X` = col_double(),
+    `Map Y` = col_double(),
+    Red = col_integer(),
+    Green = col_integer(),
+    Blue = col_integer()
+  )) %>% 
+    select(`Map X`, `Map Y`, Red, Green, Blue) %>% 
+    mutate(BT = "TRUE")
+)
+
+non_blue_data <- map_dfr(non_blue_files, ~ 
+  read_table(.x, comment = ";", col_names = col_names, col_types = cols(
+    `Map X` = col_double(),
+    `Map Y` = col_double(),
+    Red = col_integer(),
+    Green = col_integer(),
+    Blue = col_integer()
+  )) %>% 
+    select(`Map X`, `Map Y`, Red, Green, Blue) %>% 
+    mutate(BT = "FALSE")
+)
+
+holdout_data <- bind_rows(blue_data, non_blue_data) %>% 
+  mutate(BT = factor(BT, levels = c("TRUE", "FALSE")))
+```
+
+```{r training data processing}
+#| message: FALSE
+
+train_data <- read_csv("HaitiPixels.csv") %>%
+  mutate(BT = factor(if_else(Class == "Blue Tarp", "TRUE", "FALSE"), levels = c("TRUE", "FALSE"))) %>%
+  select(Red, Green, Blue, BT, Class)
+```
+
+```{r create random grid}
+train_data <- train_data %>%
+  group_by(Class) %>%
+  slice_sample(prop = 1) %>%  # Randomly shuffle the rows within each class
+  mutate(
+    # Assign a sequential pixel number after the random shuffle
+    pixel_number = row_number(),
+    # Compute the minimum grid dimension required to form a square
+    grid_dim = ceiling(sqrt(n())),
+    # Determine the x coordinate (column index) in the grid
+    x = ((pixel_number - 1) %% grid_dim) + 1,
+    # Determine the y coordinate (row index) in the grid
+    y = floor((pixel_number - 1) / grid_dim) + 1
+  ) %>%
+  ungroup() %>%
+  select(-grid_dim, -pixel_number)
+```
+
+
+### Feature Engineering
+```{r add CIELab and HSV}
+convert_color_spaces <- function(data) {
+  # Convert RGB to CIELab
+  lab_values <- farver::convert_colour(
+    as.matrix(data[, c("Red", "Green", "Blue")]), 
+    from = "rgb", 
+    to = "lab"
+  )
+  
+  # Convert RGB to HSV
+  hsv_values <- farver::convert_colour(
+    as.matrix(data[, c("Red", "Green", "Blue")]), 
+    from = "rgb", 
+    to = "hsv"
+  )
+  
+  # Convert
+  lab_df <- as.data.frame(lab_values)
+  colnames(lab_df) <- c("Luminance", "a", "b") 
+  hsv_df <- as.data.frame(hsv_values)
+  colnames(hsv_df) <- c("Hue", "Saturation", "Value")
+  
+  # Bind new columns
+  data <- cbind(data, lab_df, hsv_df)
+  
+  return(data)
+}
+
+# Apply function
+train_data <- convert_color_spaces(train_data)
+holdout_data <- convert_color_spaces(holdout_data)
+```
+
+```{r calculate prop values}
+# For the training data
+train_data <- train_data %>%
+  mutate(total = Red + Green + Blue,
+         Red_Prop = Red / total,
+         Green_Prop = Green / total,
+         Blue_Prop = Blue / total) %>%
+  select(-total)
+
+# For the holdout data
+holdout_data <- holdout_data %>%
+  mutate(total = Red + Green + Blue,
+         Red_Prop = Red / total,
+         Green_Prop = Green / total,
+         Blue_Prop = Blue / total) %>%
+  select(-total)
+```
+
+```{r calculate dispersion}
+# For the training data
+train_data <- train_data %>%
+  mutate(
+    Dispersion = abs(Red_Prop - 1/3) + abs(Green_Prop - 1/3) + abs(Blue_Prop - 1/3)
+  )
+
+# For the holdout data
+holdout_data <- holdout_data %>%
+  mutate(
+    Dispersion = abs(Red_Prop - 1/3) + abs(Green_Prop - 1/3) + abs(Blue_Prop - 1/3)
+  )
+```
+
+```{r calculate shifted hue}
+# For the training data
+train_data <- train_data %>%
+  mutate(Hue_Shifted = (Hue + (360 * 0.25)) %% 1)
+
+# For the holdout data
+holdout_data <- holdout_data %>%
+  mutate(Hue_Shifted = (Hue + (360 * 0.25)) %% 1)
+```
+
+```{r calculate area stats}
+# Check if train_data.rds exists; if yes, load it, otherwise compute neighbor means and save.
+if (file.exists("train_data.rds")) {
+  train_data <- readRDS("train_data.rds")
+} else {
+  # Define a function to compute the 3×3 neighborhood means for a given observation within the same class
+  compute_neighbor_means <- function(df, group_val, cur_x, cur_y) {
+    df %>%
+      filter(Class == group_val,
+             x >= (cur_x - 1), x <= (cur_x + 1),
+             y >= (cur_y - 1), y <= (cur_y + 1)) %>%
+      summarize(
+        Red_9 = mean(Red, na.rm = TRUE),
+        Green_9 = mean(Green, na.rm = TRUE),
+        Blue_9 = mean(Blue, na.rm = TRUE),
+        Luminance_9 = mean(Luminance, na.rm = TRUE),
+        a_9 = mean(a, na.rm = TRUE),
+        b_9 = mean(b, na.rm = TRUE),
+        Hue_9 = mean(Hue, na.rm = TRUE),
+        Saturation_9 = mean(Saturation, na.rm = TRUE),
+        Value_9 = mean(Value, na.rm = TRUE),
+        Red_Prop_9 = mean(Red_Prop, na.rm = TRUE),
+        Green_Prop_9 = mean(Green_Prop, na.rm = TRUE),
+        Blue_Prop_9 = mean(Blue_Prop, na.rm = TRUE),
+        Dispersion_9 = mean(Dispersion, na.rm = TRUE),
+        Hue_Shifted_9 = mean(Hue_Shifted, na.rm = TRUE)
+      )
+  }
+  
+  # Specify the required new columns for the neighborhood means
+  required_columns <- c("Red_9", "Green_9", "Blue_9", "Luminance_9", "a_9", "b_9", 
+                        "Hue_9", "Saturation_9", "Value_9", "Red_Prop_9", 
+                        "Green_Prop_9", "Blue_Prop_9", "Dispersion_9", "Hue_Shifted_9")
+  
+  # Check if the required columns are present; if not, compute them.
+  if (!all(required_columns %in% names(train_data))) {
+    train_data <- train_data %>%
+      rowwise() %>%
+      mutate(neighbor_values = list(compute_neighbor_means(train_data, Class, x, y))) %>%
+      ungroup() %>%
+      unnest(cols = c(neighbor_values))
+  }
+  
+  # Save the newly computed train_data as an RDS file for future use.
+  saveRDS(train_data, "train_data.rds")
+}
+```
+
+```{r spatial stats for holdout}
+# 1. Add a unique row identifier to the holdout
+holdout_data <- holdout_data %>%
+  mutate(row_id = row_number())
+
+# 2. Prepare spatial data
+holdout_data_sp <- holdout_data %>% 
+  rename(x = `Map X`, y = `Map Y`)
+
+# 3. Convert the holdout data to a spatial vector
+v_holdout <- vect(holdout_data_sp, geom = c("x", "y"), crs = "EPSG:32618")
+
+# 4. Create an empty raster 
+r_empty <- rast(ext(v_holdout), resolution = 0.08, crs = "EPSG:32618")
+
+# 5. Specify the predictor variables of interest
+var_names <- c("Red", "Green", "Blue")
+
+# 6. Rasterize each predictor variable from the spatial vector using the same empty raste
+raster_list <- lapply(var_names, function(var) {
+  rasterize(v_holdout, r_empty, field = var, overwrite = TRUE)
+})
+names(raster_list) <- var_names
+
+# 7. rasterize the row_id
+r_rowid <- rasterize(v_holdout, r_empty, field = "row_id", overwrite = TRUE)
+
+# 8. Define a 3×3 moving window
+w <- matrix(1, nrow = 3, ncol = 3)
+
+# 9. Compute the focal mean
+focal_list <- lapply(raster_list, function(r) {
+  focal(r, w = w, fun = mean, na.rm = TRUE)
+})
+names(focal_list) <- paste0("local_", var_names)
+```
+
+```{r holdout spatial stats convert raster back}
+# Create the row_id data frame once
+df_rowid <- as.data.frame(r_rowid, xy = TRUE)
+if (!("row_id" %in% names(df_rowid))) {
+  colnames(df_rowid)[3] <- "row_id"
+}
+df_rowid <- df_rowid[, c("x", "y", "row_id")]
+
+# For each focal result, convert it to a data frame
+df_list <- lapply(names(focal_list), function(name) {
+  df <- as.data.frame(focal_list[[name]], xy = TRUE)
+  colnames(df)[3] <- paste0(name, "_9")
+  return(df)
+})
+names(df_list) <- names(focal_list)
+```
+
+```{r holdout spatial stats reduce}
+# Merge all the individual data frames on x and y
+local_means_df <- Reduce(function(df1, df2) full_join(df1, df2, by = c("x", "y")), df_list)
+
+# Join the row_id data once using the common x and y coordinates
+local_means_df <- left_join(local_means_df, df_rowid, by = c("x", "y"))
+```
+
+```{r holdout spatial stats merge}
+# 12. merge the computed neighborhood means back into the original holdout data
+holdout_data_neighborhood <- holdout_data_sp %>%
+  left_join(local_means_df, by = "row_id")
+
+head(holdout_data_neighborhood)
+```
+
+```{r process additional variables}
+var_names <- c("Luminance", "a", "b", "Hue", "Saturation", "Value")
+
+raster_list <- lapply(var_names, function(var) {
+  rasterize(v_holdout, r_empty, field = var, overwrite = TRUE)
+})
+names(raster_list) <- var_names
+
+focal_list <- lapply(raster_list, function(r) {
+  focal(r, w = w, fun = mean, na.rm = TRUE)
+})
+names(focal_list) <- paste0("local_", var_names)
+
+df_list <- lapply(names(focal_list), function(name) {
+  df <- as.data.frame(focal_list[[name]], xy = TRUE)
+  colnames(df)[3] <- paste0(name, "_9")
+  return(df)
+})
+names(df_list) <- names(focal_list)
+
+local_means_df <- Reduce(function(df1, df2) full_join(df1, df2, by = c("x", "y")), df_list)
+
+local_means_df <- left_join(local_means_df, df_rowid, by = c("x", "y"))
+
+holdout_data_neighborhood <- holdout_data_sp %>%
+  left_join(local_means_df, by = "row_id")
+
+head(holdout_data_neighborhood)
+```
+
+```{r process more additional variables}
+var_names <- c("Red_Prop", "Green_Prop", "Blue_Prop", "Dispersion", "Hue_Shifted")
+
+raster_list <- lapply(var_names, function(var) {
+  rasterize(v_holdout, r_empty, field = var, overwrite = TRUE)
+})
+names(raster_list) <- var_names
+
+focal_list <- lapply(raster_list, function(r) {
+  focal(r, w = w, fun = mean, na.rm = TRUE)
+})
+names(focal_list) <- paste0("local_", var_names)
+
+df_list <- lapply(names(focal_list), function(name) {
+  df <- as.data.frame(focal_list[[name]], xy = TRUE)
+  colnames(df)[3] <- paste0(name, "_9")
+  return(df)
+})
+names(df_list) <- names(focal_list)
+
+local_means_df <- Reduce(function(df1, df2) full_join(df1, df2, by = c("x", "y")), df_list)
+
+local_means_df <- left_join(local_means_df, df_rowid, by = c("x", "y"))
+
+holdout_data_neighborhood_2 <- holdout_data_sp %>%
+  left_join(local_means_df, by = "row_id")
+
+head(holdout_data_neighborhood_2)
+```
+
+```{r merge and rename holdout neighborhood}
+library(dplyr)
+
+# Assume holdout_data, holdout_data_neighborhood, and holdout_data_neighborhood_2 exist and have a common unique identifier "row_id"
+
+# Select the columns ending in "_9" plus the row_id from holdout_data_neighborhood
+neigh1_cols <- colnames(holdout_data_neighborhood)
+selected_cols1 <- c("row_id", grep("_9$", neigh1_cols, value = TRUE))
+holdout_data_neigh1 <- holdout_data_neighborhood %>% select(all_of(selected_cols1))
+
+# Select the columns ending in "_9" plus the row_id from holdout_data_neighborhood_2
+neigh2_cols <- colnames(holdout_data_neighborhood_2)
+selected_cols2 <- c("row_id", grep("_9$", neigh2_cols, value = TRUE))
+holdout_data_neigh2 <- holdout_data_neighborhood_2 %>% select(all_of(selected_cols2))
+
+# Join the neighborhood data with holdout_data by row_id
+holdout_data_joined <- holdout_data %>%
+  left_join(holdout_data_neigh1, by = "row_id") %>%
+  left_join(holdout_data_neigh2, by = "row_id")
+
+# Remove the "local_" prefix from any columns (for example, "local_Red_9" becomes "Red_9")
+holdout_data_joined <- holdout_data_joined %>%
+  rename_with(~ gsub("^local_", "", .x), .cols = starts_with("local_"))
+
+holdout_data_joined <- select(holdout_data_joined, -x.y, -y.y)
+
+holdout_data_joined <- rename(holdout_data_joined, x = x.x, y = y.x)
+
+holdout_data <- holdout_data_joined
+```
+
+```{r save holdout data}
+saveRDS(holdout_data, "holdout_data.rds")
+```
+
+
+
+## Elastic net analysis (Clay Harris)
+
+```{r lasso}
+formula <- BT ~ Red + Green + Blue + Luminance + a + b + Hue + Saturation + Value + Red_Prop + Green_Prop + Blue_Prop + Dispersion + Hue_Shifted + Red_9 + Green_9 + Blue_9 + Luminance_9 + a_9 + b_9 + Hue_9 + Saturation_9 + Value_9 + Red_Prop_9 + Green_Prop_9 + Blue_Prop_9 + Dispersion_9 + Hue_Shifted_9
+
+#formula <- BT ~ Red + Green + Blue + Red_Prop + Green_Prop + Blue_Prop + Dispersion + Red_9 + Green_9 + Blue_9 + Red_Prop_9 + Green_Prop_9 + Blue_Prop_9 + Dispersion_9
+
+#formula <- BT ~ Red + Green + Blue + Red_9 + Green_9 + Blue_9
+
+rec <- recipe(formula, data = train_data) %>%
+  step_normalize(all_numeric_predictors())
+
+set.seed(1) # for reproducibility
+resamples <- vfold_cv(train_data, v=10, strata=BT)
+cv_control <- control_resamples(save_pred=TRUE)
+
+tune_logreg_spec <- logistic_reg(engine="glmnet", mode="classification",
+                                 penalty=tune(), mixture=tune())
+
+tune_logreg_wf <- workflow() %>%
+  add_recipe(rec) %>%
+  add_model(tune_logreg_spec)
+logreg_params <- extract_parameter_set_dials(tune_logreg_wf) %>%
+  update(
+    penalty=penalty(c(-2, -0.5)),
+    mixture=mixture(c(0, 1)))
+
+tune_results_logreg <- tune_grid(tune_logreg_wf,
+                                 resamples=resamples,
+                                 control=cv_control,
+                                 metrics = metric_set(roc_auc, accuracy),
+                                 grid=grid_random(logreg_params, size=50))
+
+autoplot(tune_results_logreg)
+```
+
+```{r select best}
+
+# Extract best parameters from the tuning results object
+best_logreg <- select_best(tune_results_logreg, metric = "roc_auc")
+
+# Finalize the workflow with the best parameters
+final_logreg_fit <- finalize_workflow(tune_logreg_wf, best_logreg) %>% 
+  fit(data = train_data)
+
+# Extract the model coefficients
+tidy(final_logreg_fit)
+```
+
+```{r cross validation approach}
+# Define cross-validation approach
+set.seed(1)
+
+resamples <- vfold_cv(train_data, v = 10, strata = BT)
+custom_metrics <- metric_set(roc_auc, accuracy, precision, f_meas)
+cv_control <- control_resamples(save_pred = TRUE)
+```
+
+```{r knn with pca}
+library(tidymodels)
+library(tune)
+library(ggplot2)
+
+# Define the model formula (using all predictors including PCA-tuned ones)
+knn_formula <- BT ~ Red + Green + Blue + Luminance + a + b + Hue + Saturation + Value +
+  Red_Prop + Green_Prop + Blue_Prop + Dispersion + Hue_Shifted +
+  Red_9 + Green_9 + Blue_9 + Luminance_9 + a_9 + b_9 + Hue_9 + Saturation_9 + Value_9 +
+  Red_Prop_9 + Green_Prop_9 + Blue_Prop_9 + Dispersion_9 + Hue_Shifted_9
+
+# Build a recipe: normalize all numeric predictors then apply PCA with tunable components
+rec <- recipe(knn_formula, data = train_data) %>%
+  step_normalize(all_numeric_predictors()) %>%
+  step_pca(all_predictors(), num_comp = tune())
+
+# Define 10-fold cross-validation using stratification on BT
+set.seed(1)
+resamples <- vfold_cv(train_data, v = 10, strata = BT)
+cv_control <- control_resamples(save_pred = TRUE)
+
+# Specify the k-NN model with tunable neighbors
+tune_knn_spec <- nearest_neighbor(neighbors = tune()) %>%
+  set_engine("kknn") %>%
+  set_mode("classification")
+
+# Create a workflow with the recipe and model
+tune_knn_wf <- workflow() %>%
+  add_recipe(rec) %>%
+  add_model(tune_knn_spec)
+
+# Extract tunable parameters; here we tune both 'neighbors' and the number of PCA components
+knn_params <- extract_parameter_set_dials(tune_knn_wf) %>%
+  update(
+    neighbors = neighbors(range = c(1, 100)),
+    num_comp = num_comp(range = c(1, 28))
+  )
+
+# First pass: Grid tuning over a regular grid (e.g., 5 levels for each parameter)
+set.seed(1)
+grid_results_knn <- tune_grid(
+  tune_knn_wf,
+  resamples = resamples,
+  grid = grid_regular(knn_params, levels = 5),
+  metrics = metric_set(roc_auc, accuracy),
+  control = cv_control
+)
+```
+
+```{r knn autoplot 1}
+autoplot(grid_results_knn)
+```
+
+```{r knn second pass bayes}
+# Second pass: Bayesian optimization using the grid tuning results as initial design;
+# here we run 20 iterations of Bayesian tuning.
+set.seed(1)
+bayes_results_knn <- tune_bayes(
+  tune_knn_wf,
+  resamples = resamples,
+  initial = grid_results_knn,
+  param_info = knn_params,
+  iter = 5,
+  metrics = metric_set(roc_auc, accuracy),
+  control = control_bayes(verbose = TRUE, save_pred = TRUE)
+)
+
+# Select the best parameters (for example, using roc_auc as the primary metric)
+best_knn <- select_best(bayes_results_knn, metric = "roc_auc")
+
+# Finalize the workflow with the best parameters, and fit the model to the full training data
+final_knn_wf <- finalize_workflow(tune_knn_wf, best_knn)
+final_knn_fit <- final_knn_wf %>% fit(data = train_data)
+
+# View the final model (the underlying fitted model can be extracted with extract_fit_parsnip())
+final_knn_fit
+```
+
+```{r autoplot bayes knn}
+autoplot(bayes_results_knn)
+```
+
+```{r set formulas}
+# RGB Model Formula and Recipe
+rgb_formula <- BT ~ Red + Green + Blue
+rgb_recipe <- recipe(rgb_formula, data = train_data)
+
+# CIELab Model Formula and Recipe
+lab_formula <- BT ~ Luminance + a + b
+lab_recipe <- recipe(lab_formula, data = train_data)
+
+# HSV Model Formula and Recipe
+hsv_formula <- BT ~ Hue + Saturation + Value
+hsv_recipe <- recipe(hsv_formula, data = train_data)
+```
+
+```{r specify models}
+# Specify models
+logreg_spec <- logistic_reg(mode="classification", engine="glm")
+```
+
+```{r define workflows}
+# RGB Models
+logreg_rgb_wf <- workflow() %>% add_recipe(rgb_recipe) %>% add_model(logreg_spec)
+
+# CIELab Models
+logreg_lab_wf <- workflow() %>% add_recipe(lab_recipe) %>% add_model(logreg_spec)
+
+# HSV Models
+logreg_hsv_wf <- workflow() %>% add_recipe(hsv_recipe) %>% add_model(logreg_spec)
+```
+
+```{r cross validate tuned}
+# Finalize the workflow using the best parameters
+final_logreg_wf <- finalize_workflow(tune_logreg_wf, best_logreg)
+
+# Generate a cross-validation object from the finalized workflow
+final_logreg_cv <- fit_resamples(
+  final_logreg_wf,
+  resamples = resamples,
+  metrics = custom_metrics,
+  control = cv_control
+)
+```
+
+```{r cross validate logreg}
+# Cross-validation for RGB models
+logreg_rgb_cv <- fit_resamples(logreg_rgb_wf, resamples, metrics = custom_metrics, control = cv_control)
+
+# Cross-validation for CIELab models
+logreg_lab_cv <- fit_resamples(logreg_lab_wf, resamples, metrics = custom_metrics, control = cv_control)
+
+# Cross-validation for HSV models
+logreg_hsv_cv <- fit_resamples(logreg_hsv_wf, resamples, metrics = custom_metrics, control = cv_control)
+```
+
+```{r fit final models on train}
+# Fit final models on train_data for RGB
+final_logreg_rgb_fit <- logreg_rgb_wf %>% fit(data = train_data)
+
+# Fit final models on train_data for CIELab
+final_logreg_lab_fit <- logreg_lab_wf %>% fit(data = train_data)
+
+# Fit final models on train_data for HSV
+final_logreg_hsv_fit <- logreg_hsv_wf %>% fit(data = train_data)
+```
+
+```{r autplot roc}
+# Obtain predictions for each model on training data
+pred_logreg     <- augment(final_logreg_fit, new_data = train_data)
+pred_logreg_rgb <- augment(final_logreg_rgb_fit, new_data = train_data)
+pred_logreg_lab <- augment(final_logreg_lab_fit, new_data = train_data)
+pred_logreg_hsv <- augment(final_logreg_hsv_fit, new_data = train_data)
+
+# Compute ROC curves for each model (using .pred_TRUE as the estimated probability)
+roc_logreg     <- roc_curve(pred_logreg, truth = BT, .pred_TRUE, event_level = "first") %>% mutate(model = "Logistic Regression")
+roc_logreg_rgb <- roc_curve(pred_logreg_rgb, truth = BT, .pred_TRUE, event_level = "first") %>% mutate(model = "Logistic Regression (RGB)")
+roc_logreg_lab <- roc_curve(pred_logreg_lab, truth = BT, .pred_TRUE, event_level = "first") %>% mutate(model = "Logistic Regression (CIELab)")
+roc_logreg_hsv <- roc_curve(pred_logreg_hsv, truth = BT, .pred_TRUE, event_level = "first") %>% mutate(model = "Logistic Regression (HSV)")
+
+# Combine all ROC curves
+roc_all <- bind_rows(roc_logreg, roc_logreg_rgb, roc_logreg_lab, roc_logreg_hsv)
+
+# Option 2: Using yardstick's autoplot (if it supports the grouping variable)
+autoplot(roc_all) +
+  labs(title = "Overlay of ROC Curves for Logistic Regression Models",
+       x = "1 - Specificity",
+       y = "Sensitivity",
+       color = "Model")
+```
+
+```{r threshold graphs 1}
+threshold_graph <- function(model_cv, model_name) {
+    performance <- probably::threshold_perf(collect_predictions(model_cv), BT, .pred_TRUE,
+        thresholds=seq(0.01, 0.99, 0.01), event_level="first",
+        metrics=metric_set(f_meas, accuracy, sens))
+    max_metrics <- performance %>%
+        drop_na() %>%
+        group_by(.metric) %>%
+        filter(.estimate == max(.estimate))
+    g <- ggplot(performance, aes(x=.threshold, y=.estimate, color=.metric)) +
+        geom_line() +
+        geom_point(data=max_metrics, color="black") +
+        labs(title=model_name, x="Threshold", y="Metric value") +
+        coord_cartesian(ylim=c(0, 1))
+    thresholds <- max_metrics %>%
+        select(.metric, .threshold) %>%
+        deframe()
+    return(list(graph=g, thresholds=thresholds))
+}
+
+visualize_conf_mat <- function(model_cv, thresholds, metric) {
+    threshold <- thresholds[metric]
+    cm <- collect_predictions(model_cv) %>%
+        mutate(
+            .pred_class = make_two_class_pred(.pred_TRUE, c("TRUE", "FALSE"), threshold=threshold),
+        ) %>%
+        conf_mat(truth=BT, estimate=.pred_class)
+    autoplot(cm, type="heatmap") +
+        labs(title=sprintf("Threshold %.2f (%s)", threshold, metric))
+}
+
+overview_model <- function(model_cv, model_name) {
+    tg <- threshold_graph(model_cv, model_name)
+    g1 <- visualize_conf_mat(model_cv, tg$thresholds, "accuracy")
+    g2 <- visualize_conf_mat(model_cv, tg$thresholds, "f_meas")
+    g3 <- visualize_conf_mat(model_cv, tg$thresholds, "sens")
+    tg$graph + (g1 / g2 / g3)
+}
+```
+
+```{r threshold measure apply function}
+# RGB Models
+rgb_g1 <- overview_model(logreg_rgb_cv, "Logistic Regression (RGB)")
+
+# CIELab Models
+lab_g1 <- overview_model(logreg_lab_cv, "Logistic Regression (CIELab)")
+
+# HSV Models
+hsv_g1 <- overview_model(logreg_hsv_cv, "Logistic Regression (HSV)")
+
+#Tuned Model
+tuned_g1 <- overview_model(final_logreg_cv, "Tuned Logistic Regression (Elastic Net)")
+```
+
+```{r print first threshold imgs}
+#| fig.width: 10
+#| fig.height: 15
+#| out.width: 100%
+#| fig.cap: Metrics as a function of threshold optimization across all color spaces.
+#| warning: FALSE
+# Arrange in 3 rows (RGB, CIELab, HSV)
+combined_threshold_plots <- (rgb_g1) /
+                            (lab_g1) /
+                            (hsv_g1) /
+                            (tuned_g1)
+
+# Print the combined plot
+combined_threshold_plots
+
+ggsave("combined_threshold_plots_elastic.png", plot = combined_threshold_plots, width = 10, height = 15, dpi = 600)
+```
+
+```{r compare roc-auc cv and full train}
+compute_roc_diff <- function(cv_object, workflow, train_data) {
+  # Cross-validation ROC-AUC (mean value)
+  cv_roc <- collect_metrics(cv_object) %>%
+    filter(.metric == "roc_auc") %>%
+    pull(mean)
+  
+  # Fit the model
+  final_fit <- workflow %>% fit(train_data)
+  
+  # Evaluate ROC-AUC
+  full_preds <- augment(final_fit, new_data = train_data)
+  
+  full_roc <- roc_auc(full_preds, truth = BT, .pred_TRUE, event_level = "first") %>%
+    pull(.estimate)
+  
+  # Return a tibble with ROC values and their difference
+  tibble(
+    cv_roc = cv_roc,
+    full_roc = full_roc,
+    diff = full_roc - cv_roc
+  )
+}
+
+roc_diff_results <- bind_rows(
+  compute_roc_diff(logreg_rgb_cv, logreg_rgb_wf, train_data) %>% 
+    mutate(model = "Logistic Regression", color_space = "RGB"),
+  
+  compute_roc_diff(logreg_lab_cv, logreg_lab_wf, train_data) %>% 
+    mutate(model = "Logistic Regression", color_space = "CIELab"),
+  
+  compute_roc_diff(logreg_hsv_cv, logreg_hsv_wf, train_data) %>% 
+    mutate(model = "Logistic Regression", color_space = "HSV"),
+  
+   compute_roc_diff(final_logreg_cv, final_logreg_wf, train_data) %>% 
+    mutate(model = "Tuned Logistic Regression (Elastic Net)", color_space = "All Predictor Variables")
+)
+
+roc_diff_results <- roc_diff_results %>%
+  mutate(
+    color_space = factor(color_space, levels = c("RGB", "CIELab", "HSV", "All Predictor Variables")),
+    model = factor(model, levels = c("Logistic Regression", "Tuned Logistic Regression (Elastic Net)"))
+  ) %>%
+  arrange(color_space, model) %>%
+  select(color_space, model, cv_roc, full_roc, diff) %>%
+  kable(
+    caption = "Comparison of ROC-AUC between cross-validation and full-training fits",
+    digits = 6,
+    col.names = c("Color Space", "Model", "ROC-AUC of CV Folds", "ROC-AUC of Fitted Model", "Difference")
+  ) %>%
+  kable_styling(full_width = FALSE) %>%
+  collapse_rows(columns = 1, valign = "top")
+
+roc_diff_results
+```
+
+```{r save roc cv kable}
+save_kable(roc_diff_results, file = "roc_diff_results_elastic.png", zoom = 2)
+```
+
+```{r optimal thresholds}
+# Find optimal thresholds
+threshold_scan <- function(model, data, model_name) {
+  threshold_data <- model %>%
+    augment(data) %>%
+    probably::threshold_perf(
+      truth = BT,
+      estimate = .pred_TRUE,
+      thresholds = seq(0.01, 0.99, 0.01),
+      event_level = "first",
+      metrics = metric_set(f_meas)
+    )
+  opt_threshold <- threshold_data %>%
+    drop_na() %>%
+    arrange(desc(.estimate)) %>%
+    slice(1)
+  list(
+    threshold = opt_threshold$.threshold,
+    threshold_data = threshold_data,
+    opt_threshold = opt_threshold,
+    model_name = model_name
+  )
+}
+```
+
+```{r scan threshold holdout}
+# For RGB model:
+if (file.exists("logreg_rgb_result.rds")) {
+  logreg_rgb_result <- readRDS("logreg_rgb_result.rds")
+} else {
+  logreg_rgb_result <- threshold_scan(final_logreg_rgb_fit, holdout_data, "Logistic Regression (RGB)")
+  saveRDS(logreg_rgb_result, "logreg_rgb_result.rds")
+}
+
+# For CIELab model:
+if (file.exists("logreg_lab_result.rds")) {
+  logreg_lab_result <- readRDS("logreg_lab_result.rds")
+} else {
+  logreg_lab_result <- threshold_scan(final_logreg_lab_fit, holdout_data, "Logistic Regression (CIELab)")
+  saveRDS(logreg_lab_result, "logreg_lab_result.rds")
+}
+
+# For HSV model:
+if (file.exists("logreg_hsv_result.rds")) {
+  logreg_hsv_result <- readRDS("logreg_hsv_result.rds")
+} else {
+  logreg_hsv_result <- threshold_scan(final_logreg_hsv_fit, holdout_data, "Logistic Regression (HSV)")
+  saveRDS(logreg_hsv_result, "logreg_hsv_result.rds")
+}
+
+# For Tuned Logistic Regression (Elastic Net):
+if (file.exists("logreg_tune_result.rds")) {
+  logreg_tune_result <- readRDS("logreg_tune_result.rds")
+} else {
+  logreg_tune_result <- threshold_scan(final_logreg_fit, holdout_data, "Tuned Logistic Regression (Elastic Net)")
+  saveRDS(logreg_tune_result, "logreg_tune_result.rds")
+}
+```
+
+```{r optimal thresholds set}
+# Optimal thresholds
+logreg_rgb_holdout_threshold <- logreg_rgb_result$threshold
+
+logreg_lab_holdout_threshold <- logreg_lab_result$threshold
+
+logreg_hsv_holdout_threshold <- logreg_hsv_result$threshold
+
+logreg_tune_holdout_threshold <- logreg_tune_result$threshold
+```
+
+```{r combine threshold graphs}
+#| fig.width: 6
+#| fig.height: 9
+#| fig.cap: F-Measure by threshold for each model and color space
+#| warning: FALSE
+
+# Function to plot threshold performance
+plot_threshold <- function(result) {
+  ggplot(result$threshold_data, aes(x = .threshold, y = .estimate)) +
+    geom_line() +
+    geom_point(data = result$opt_threshold, color = "red", size = 2) +
+    labs(title = result$model_name, x = "Threshold", y = "F-Measure") +
+    coord_cartesian(ylim = c(0, 1))
+}
+
+## RGB
+g_logreg_rgb <- plot_threshold(logreg_rgb_result)
+
+## CIELab
+g_logreg_lab <- plot_threshold(logreg_lab_result)
+
+## HSV
+g_logreg_hsv <- plot_threshold(logreg_hsv_result)
+
+## Tuned
+g_logreg_tune <- plot_threshold(logreg_tune_result)
+
+# Combine plots
+combined_thresholds <- (g_logreg_rgb) /
+                       (g_logreg_lab) /
+                       (g_logreg_hsv) /
+                        (g_logreg_tune) +
+                       plot_annotation(title = "Threshold Performance (F-Measure) Across Color Spaces")
+
+combined_thresholds
+
+ggsave("combined_thresholds_tune.png", plot = combined_thresholds, width = 6, height = 9, dpi = 600)
+```
+
+```{r scan threshold cv}
+threshold_scan_cv <- function(cv_obj, model_name) {
+  threshold_data <- cv_obj %>%
+    collect_predictions() %>%
+    probably::threshold_perf(
+      truth = BT,
+      estimate = .pred_TRUE,
+      thresholds = seq(0.05, 0.95, 0.01),
+      event_level = "first",
+      metrics = metric_set(f_meas)
+    )
+  opt_threshold <- threshold_data %>%
+    drop_na() %>%
+    arrange(desc(.estimate)) %>%
+    slice(1)
+  list(
+    threshold = opt_threshold$.threshold
+  )
+}
+
+# Compute thresholds
+
+## RGB Models
+logreg_rgb_train_result <- threshold_scan_cv(logreg_rgb_cv, "Logistic Regression (RGB)")
+
+## CIELab Models
+logreg_lab_train_result <- threshold_scan_cv(logreg_lab_cv, "Logistic Regression (CIELab)")
+
+## HSV Models
+logreg_hsv_train_result <- threshold_scan_cv(logreg_hsv_cv, "Logistic Regression (HSV)")
+
+## Tuned Models
+logreg_tune_train_result <- threshold_scan_cv(final_logreg_cv, "Tuned Logistic Regression (Elastic Net)")
+
+# Extract optimal thresholds
+
+## RGB
+logreg_rgb_train_threshold <- logreg_rgb_train_result$threshold
+
+## CIELab
+logreg_lab_train_threshold <- logreg_lab_train_result$threshold
+
+## HSV
+logreg_hsv_train_threshold <- logreg_hsv_train_result$threshold
+
+## Tune
+logreg_tune_train_threshold <- logreg_tune_train_result$threshold
+```
+
+```{r model evaluation functions}
+predict_at_threshold <- function(model, data, threshold) {
+  model %>%
+    augment(data) %>%
+    mutate(
+      .pred_class = make_two_class_pred(
+        .pred_TRUE,
+        c("TRUE", "FALSE"),
+        threshold = threshold
+      )
+    )
+}
+
+calculate_metrics_at_threshold <- function(
+  model,
+  train,
+  holdout,
+  model_name,
+  color_space,
+  train_threshold,
+  holdout_threshold
+) {
+  bind_rows(
+    # Metrics for the training set
+    bind_cols(
+      color_space = color_space,
+      model = model_name,
+      dataset = "train",
+      threshold = train_threshold,
+      metrics(predict_at_threshold(model, train, train_threshold), truth = BT, estimate = .pred_class)
+    ),
+    bind_cols(
+      color_space = color_space,
+      model = model_name,
+      dataset = "train",
+      threshold = train_threshold,
+      roc_auc(model %>% augment(train), truth = BT, .pred_TRUE, event_level = "first")
+    ),
+    bind_cols(
+      color_space = color_space,
+      model = model_name,
+      dataset = "train",
+      threshold = train_threshold,
+      f_meas(predict_at_threshold(model, train, train_threshold), truth = BT, estimate = .pred_class)
+    ),
+    bind_cols(
+      color_space = color_space,
+      model = model_name,
+      dataset = "train",
+      threshold = train_threshold,
+      sens(predict_at_threshold(model, train, train_threshold), truth = BT, estimate = .pred_class)
+    ),
+    # Metrics for the holdout set
+    bind_cols(
+      color_space = color_space,
+      model = model_name,
+      dataset = "holdout",
+      threshold = holdout_threshold,
+      metrics(predict_at_threshold(model, holdout, holdout_threshold), truth = BT, estimate = .pred_class)
+    ),
+    bind_cols(
+      color_space = color_space,
+      model = model_name,
+      dataset = "holdout",
+      threshold = holdout_threshold,
+      roc_auc(model %>% augment(holdout), BT, .pred_TRUE, event_level = "first")
+    ),
+    bind_cols(
+      color_space = color_space,
+      model = model_name,
+      dataset = "holdout",
+      threshold = holdout_threshold,
+      f_meas(predict_at_threshold(model, holdout, holdout_threshold), truth = BT, estimate = .pred_class)
+    ),
+    bind_cols(
+      color_space = color_space,
+      model = model_name,
+      dataset = "holdout",
+      threshold = holdout_threshold,
+      sens(predict_at_threshold(model, holdout, holdout_threshold), truth = BT, estimate = .pred_class)
+    )
+  )
+}
+```
+
+```{r metrics get}
+metrics_at_threshold <- bind_rows(
+  # RGB Models
+  calculate_metrics_at_threshold(
+    final_logreg_rgb_fit, train_data, holdout_data,
+    "Logistic Regression", "RGB",
+    logreg_rgb_train_threshold, logreg_rgb_holdout_threshold
+  ),
+  
+  # CIELab Models
+  calculate_metrics_at_threshold(
+    final_logreg_lab_fit, train_data, holdout_data,
+    "Logistic Regression", "CIELab",
+    logreg_lab_train_threshold, logreg_lab_holdout_threshold
+  ),
+  
+  # HSV Models
+  calculate_metrics_at_threshold(
+    final_logreg_hsv_fit, train_data, holdout_data,
+    "Logistic Regression", "HSV",
+    logreg_hsv_train_threshold, logreg_hsv_holdout_threshold
+  ),
+  
+  # Tuned Models
+  calculate_metrics_at_threshold(
+    final_logreg_fit, train_data, holdout_data,
+    "Tuned Logistic Regression (Elastic Net)", "All Predictors",
+    logreg_tune_train_threshold, logreg_tune_holdout_threshold
+  )
+  
+) %>%
+  arrange(dataset, color_space, model)
+```
+
+```{r model eval table}
+metrics_at_threshold_tune <- metrics_at_threshold %>%
+  mutate(
+    dataset = factor(dataset, levels = c("train", "holdout")),
+    color_space = factor(color_space, levels = c("RGB", "CIELab", "HSV", "All Predictors")),
+    model = factor(model, levels = c("Logistic Regression", "LDA", "QDA", "Tuned Logistic Regression (Elastic Net)"))
+  ) %>%
+  tidyr::pivot_wider(names_from = .metric, values_from = .estimate) %>%
+  select(
+    dataset, color_space, model, threshold, 
+    accuracy, roc_auc, sens, f_meas
+  ) %>%
+  arrange(dataset, color_space, model, threshold) %>%
+  knitr::kable(
+    caption = "Final metrics for models at chosen thresholds.",
+    digits = 4
+  ) %>%
+  kableExtra::kable_styling(full_width = FALSE) %>%
+  kableExtra::collapse_rows(columns = 1:2, valign = "top")
+
+metrics_at_threshold_tune
+
+save_kable(metrics_at_threshold_tune, file = "metrics_at_threshold_tune.png", zoom = 2)
+```
+
+
+
+## KNN and Ramdom Forest Analysis (Virginia Brame)
+
+```{r setup}
+knitr::opts_chunk$set(
+  echo = FALSE,
+  cache = TRUE,
+  autodep = TRUE,
+  fig.align = "center",
+  fig.pos = "H",
+  out.width = "100%"
+)
+```
+
+```{r libraries}
+#| cache: FALSE
+#| warning: FALSE
+#| message: FALSE
+library(tidyverse)
+library(tidymodels)
+library(discrim)
+library(patchwork)
+library(probably)
+library(gridExtra)
+library(kableExtra)
+library(kknn)
+library(xgboost) # in case I try this too
+library(randomForest)
+library(themis)  # step_downsample
+library(ranger)  # random forest engine
+```
+
+```{r}
+library(doParallel)
+cl <- makePSOCKcluster(10)
+registerDoParallel(cl)
+```
+### Recap
+
+Not needing to recreate the data exploration completed in part I, we will begin exploring a number of regression models and assess their predictive ability with the RGB training and holdout sets, revisiting previous work as needed for explanation.
+
+It is worth noting, once again, that the "holdout" set we will refer to is not a true holdout set in the sense that it is not a split from a unified data set. It is completely new data from a different geographic coordinates with an unrelated color composition. As such, there was no stratification with respect for the response variable density and we have already learned in part I that the response variable in this holdout data set is even more rare than in the training data set, leading to a challenging an unbalanced classification problem.
+
+### Data loading and wrangling
+```{r holdout data processing}
+#| message: FALSE
+#| warning: FALSE
+
+col_names <- c('ID','X','Y','Map X','Map Y','Lat','Lon','Red','Green','Blue')
+
+blue_files <- c(
+  "orthovnir069_ROI_Blue_Tarps.txt",
+  "orthovnir067_ROI_Blue_Tarps.txt",
+  "orthovnir078_ROI_Blue_Tarps.txt"
+)
+
+non_blue_files <- c(
+  "orthovnir057_ROI_NON_Blue_Tarps.txt",
+  "orthovnir078_ROI_NON_Blue_Tarps.txt",
+  "orthovnir067_ROI_NOT_Blue_Tarps.txt",
+  "orthovnir069_ROI_NOT_Blue_Tarps.txt"
+)
+
+blue_data <- map_dfr(blue_files, ~ 
+  read_table(.x, comment = ";", col_names = col_names, col_types = cols(
+    `Map X` = col_double(),
+    `Map Y` = col_double(),
+    Red = col_integer(),
+    Green = col_integer(),
+    Blue = col_integer()
+  )) %>% 
+    select(`Map X`, `Map Y`, Red, Green, Blue) %>% 
+    mutate(BT = "TRUE")
+)
+
+non_blue_data <- map_dfr(non_blue_files, ~ 
+  read_table(.x, comment = ";", col_names = col_names, col_types = cols(
+    `Map X` = col_double(),
+    `Map Y` = col_double(),
+    Red = col_integer(),
+    Green = col_integer(),
+    Blue = col_integer()
+  )) %>% 
+    select(`Map X`, `Map Y`, Red, Green, Blue) %>% 
+    mutate(BT = "FALSE")
+)
+```
+
+### RGB Data
+#### RGB Training 
+```{r training data processing}
+#| message: FALSE
+
+train_data <- read_csv("HaitiPixels.csv") %>%
+  mutate(BT = factor(if_else(Class == "Blue Tarp", "TRUE", "FALSE"), levels = c("TRUE", "FALSE"))) %>%
+  select(Red, Green, Blue, BT)
+```
+
+#### RGB Holdout
+#### 0.2 sample: RGB-Holdout
+```{r}
+# RGB holdout data
+holdout_data <- bind_rows(blue_data, non_blue_data) %>% 
+  mutate(BT = factor(BT, levels = c("TRUE", "FALSE")))
+# 0.2 stratified dample of RGB holdout
+strat_holdout_sample <- holdout_data %>% 
+  group_by(BT) %>% 
+  sample_frac(size = 0.2)
+```
+
+### EV DATA - engineered variables
+#### EV Training
+```{r}
+# EV training set
+train_engineered <- readRDS("train_data _engineered_vars.rds")
+glimpse(train_engineered)
+```
+```{r}
+sum(is.na(train_engineered))
+```
+
+#### EV Holdout
+```{r}
+# EV holdout set
+# removing NAs for PCA
+holdout_engineered <- readRDS("holdout_data_engineered_vars.rds") %>% 
+  na.omit()
+glimpse(holdout_engineered)
+```
+
+#### 0.2 sample: EV-Holdout
+```{r}
+# 0.2 stratified dample of RGB holdout
+holdout_engineered_stratsample <- holdout_engineered %>% 
+  na.omit() %>% 
+  group_by(BT) %>% 
+  sample_frac(size = 0.2)
+```
+
+```{r}
+# verifying zero NA
+sum(is.na(holdout_engineered))
+sum(is.na(holdout_engineered_stratsample))
+```
+
+### BUILDING the MODELS
+
+**In this section of the analysis we are exploring the following models:**
+
+-   k-nearest neighbors with undersampling-SMOTE hybrid approach + PCA:
+      - in RGB
+      - with engineered variables dataset
+-   random forest (engine = ranger) with undersampling-SMOTE hybrid approach + PCA:
+      - in RGB
+      - with engineered variables dataset
+
+### recipes and formulas:
+
+Initial attempts to train a tuned k-nearest neighbors model using the full dataset were unsuccessful simply because the computational needs exceeded both our local machines as well as Rivanna.
+
+We pivoted to downsampling the data and combining it with SMOTE oversampling of the response variable to address the unbalanced nature of the data set.
+
+#### RGB 
+```{r}
+rgb_formula <- BT ~ Red + Green + Blue
+
+# https://themis.tidymodels.org/reference/step_downsample.html
+
+recipe_downsamp_rgb <- recipe(rgb_formula, data = train_data) %>% 
+  step_normalize(all_numeric_predictors()) %>% 
+  step_downsample(BT, under_ratio = 3, seed = 6020) 
+
+# https://themis.tidymodels.org/reference/step_smote.html
+
+recipe_hybrid_rgb <- recipe(rgb_formula, data = train_data) %>%  # this is what I retained
+  step_normalize(all_numeric_predictors()) %>% 
+  step_downsample(BT, under_ratio = 6, seed = 6020) %>% 
+  step_smote(BT, over_ratio = 0.33)
+```
+
+#### EV_RDS: Data with Engineered Variables
+```{r}
+ev_formula <- BT ~ Red + Green + Blue + Luminance + a + b + Hue + Saturation + Value + Red_Prop + Green_Prop + Blue_Prop + Dispersion + Hue_Shifted + Red_9 + Green_9 + Blue_9 + Luminance_9 + a_9 + b_9 + Hue_9 + Saturation_9 + Value_9 + Red_Prop_9 + Green_Prop_9 + Blue_Prop_9 + Dispersion_9 + Hue_Shifted_9
+
+# https://themis.tidymodels.org/reference/step_smote.html
+
+recipe_hybrid_ev <- recipe(ev_formula, data = train_engineered) %>% 
+  step_normalize(all_numeric_predictors()) %>% 
+  step_downsample(BT, under_ratio = 6, seed = 6020) %>% 
+  step_smote(BT, over_ratio = 0.33)
+```
+
+```{r}
+# before and after down_sampling
+g1 <- ggplot(train_data, aes(x=Red, y=Blue, color=BT))+
+  geom_point(alpha=0.3, size=0.1)+
+  labs(title="full dataset")
+
+g2 <- recipe_downsamp_rgb %>% 
+  prep() %>% 
+  bake(new_data = NULL) %>% 
+  ggplot(aes(x=Red, y=Blue, color=BT))+
+  geom_point(alpha=0.3, size=0.1)+
+  labs(title="downsample (1:3)")
+
+g3 <- recipe_hybrid_rgb %>% 
+  prep() %>% 
+  bake(new_data = NULL) %>% 
+  ggplot(aes(x=Red, y=Blue, color=BT))+
+  geom_point(alpha=0.3, size=0.3)+
+  labs(title="downsample + SMOTE", subtitle ="(1:6 + 0.33) hybrid on RGB")   
+
+g4 <- recipe_hybrid_ev %>% 
+  prep() %>% 
+  bake(new_data = NULL) %>% 
+  ggplot(aes(x=Red, y=Blue, color=BT))+
+  geom_point(alpha=0.3, size=0.3)+
+  labs(title="downsample + SMOTE", subtitle ="(1:6 + 0.33) hybrid with engineered variables")   
+
+(g1 + g2) / (g3 + g4)
+```
+
+#### PCA recipes
+```{r}
+# https://gedeck.github.io/DS-6030/livesessions/module-2-pca.pdf
+
+# recipe: downsampling/SMOTE + pca
+recipe_hybrid_pca_rgb <- recipe(data=train_data, formula = rgb_formula) %>% 
+  step_normalize(all_numeric_predictors()) %>% 
+  step_downsample(BT, under_ratio = 3, seed = 6020) %>% 
+  step_pca(all_numeric_predictors(), num_comp = tune())  # num_comp tune HERE
+
+# engineered recipe: downsampling/SMOTE + pca
+recipe_hybrid_pca_ev <- recipe(data=train_engineered, formula = ev_formula) %>% 
+  step_normalize(all_numeric_predictors()) %>% 
+  step_downsample(BT, under_ratio = 3, seed = 5999) %>% 
+  step_pca(all_numeric_predictors(), num_comp = tune())  # num_comp tune HERE
+```
+
+#### About cross-validation
+A 10-fold cross-validation procedure was implemented using stratified sampling to ensure that each fold maintained the same proportion of positive (`BT = TRUE`) and negative (`BT = FALSE`) cases as the full dataset. The cross-validation results allowed us to tune our hyperparameters, selecting the optimal values for peak model performance.
+
+Cross-validation performance was evaluated using ROC-AUC as the primary metric.
+
+#### preparing cross-validation
+```{r}
+set.seed(1)
+
+resamples <- vfold_cv(train_data, v=10, strata = BT)
+resamples_ev <- vfold_cv(train_engineered, v=10, strata = BT)
+cv_control <- control_resamples(save_pred = TRUE)
+
+# https://yardstick.tidymodels.org/reference/bal_accuracy.html
+
+cv_metrics <- metric_set(       # use after tuning: test the performance on the training data
+  accuracy, 
+  bal_accuracy, 
+  roc_auc, 
+  f_meas, 
+  sens
+  )
+```
+
+### K-NEAREST NEIGHBORS MODEL
+#### KNN -- RBG
+##### Tuning
+
+The k-nearest neighbors model uses principal component analysis to explore our parameter space in a different way.
+
+SMOTE/Downsampling Hybrid Method (+ tune_grid --\> tune_bayes)
+##### specs
+##### workflows
+```{r, message=FALSE}
+# https://dials.tidymodels.org/reference/dist_power.html
+# determines how "nearness" is calculated
+# straight line or "city block" distance
+
+# https://dials.tidymodels.org/reference/weight_func.html
+# uniform vs distance (closer neighbors have more influence)
+
+
+# KNN with PCA: specify models & parameters to tune
+knn_spec_pca_hybrid <- nearest_neighbor(
+  engine = "kknn",
+  mode = "classification",
+  neighbors = tune(),
+  weight_func = tune(), # uniform vs distance (closer neighbors have more influence)
+  dist_power = tune()
+)
+  
+# KNN with PCA: define workflow
+knn_pca_hybrid_wf <- workflow() %>% 
+  add_recipe(recipe_hybrid_pca_rgb) %>% 
+  add_model(knn_spec_pca_hybrid)
+
+
+# tuning model parameters WITH PCA
+tune_params_knn_phg <- extract_parameter_set_dials(knn_pca_hybrid_wf) %>% 
+  update(
+    neighbors = neighbors(range = c(3,150)),
+    weight_func = weight_func(values = values_weight_func),
+    dist_power = dist_power(range = c(1,2)),  # 1 = Manhattan dist, 2 = Euclidean
+    num_comp = num_comp(range = c(1,10))
+    )
+
+set.seed(2)
+# KNN PCA HYBRID tuning results
+tune_results_1_knn <- tune_grid(  # regular grid
+  knn_pca_hybrid_wf,
+  resamples = resamples, 
+  control = cv_control, 
+  grid = grid_random(tune_params_knn_phg, size = 25)
+)
+
+tune_results_2_knn <- tune_bayes(  # bayes initiated with regular tuning obj
+  knn_pca_hybrid_wf,
+  resamples = resamples, 
+  control = control_bayes(verbose = TRUE), # bayes needs control_bayes() obj!!
+  param_info = tune_params_knn_phg,
+  initial = tune_results_1_knn,
+  iter = 30
+)
+```
+
+```{r}
+autoplot(tune_results_2_knn)
+```
+
+```{r}
+# best parameters
+best_params_knn <- show_best(tune_results_2_knn, metric = "roc_auc", n=6)
+best_params_knn
+```
+
+##### best hyperparameters
+
+```{r}
+select_best(tune_results_2_knn, metric = "roc_auc")%>% 
+  kable(caption="<center>Best Hyperparameters for KNN (pgh)") %>% 
+  kableExtra::kable_styling(full_width = FALSE)
+```
+
+#### KNN -- EV
+##### TUNING, spec, wf
+```{r, message=FALSE}
+knn_spec_pca_hybrid_ev <- nearest_neighbor(
+  engine = "kknn",
+  mode = "classification",
+  neighbors = tune(),
+  weight_func = tune(), # uniform vs distance (closer neighbors have more influence)
+  dist_power = tune()
+)
+  
+knn_pca_hybrid_wf_ev <- workflow() %>% 
+  add_recipe(recipe_hybrid_pca_ev) %>% 
+  add_model(knn_spec_pca_hybrid_ev)
+
+tune_params_knn_phg_ev <- extract_parameter_set_dials(knn_pca_hybrid_wf_ev) %>% 
+  update(
+    neighbors = neighbors(range = c(3,150)),
+    weight_func = weight_func(values = values_weight_func),
+    dist_power = dist_power(range = c(1,2)),  # 1 = Manhattan dist, 2 = Euclidean
+    num_comp = num_comp(range = c(1,22))
+    )
+
+set.seed(2)
+
+tune_results_1_knn_ev <- tune_grid(  
+  knn_pca_hybrid_wf_ev,
+  resamples = resamples_ev, 
+  control = cv_control, 
+  grid = grid_random(tune_params_knn_phg_ev, size = 25)
+)
+
+tune_results_2_knn_ev <- tune_bayes( 
+  knn_pca_hybrid_wf_ev,
+  resamples = resamples_ev, 
+  control = control_bayes(verbose = TRUE),
+  param_info = tune_params_knn_phg_ev,
+  initial = tune_results_1_knn_ev,
+  iter = 30
+)
+```
+
+```{r}
+autoplot(tune_results_2_knn_ev)
+```
+
+```{r}
+# best parameters
+best_params_knn_ev <- show_best(tune_results_2_knn_ev, metric = "roc_auc", n=6)
+best_params_knn_ev
+```
+
+##### best hyperparameters
+
+```{r}
+select_best(tune_results_2_knn_ev, metric = "roc_auc")%>% 
+  kable(caption="<center>Best Hyperparameters for KNN with EV") %>% 
+  kableExtra::kable_styling(full_width = FALSE)
+```
+
+### RANDOM FOREST MODEL (engine: ranger)
+
+**Note about the use of PCA in Random Forest**
+For the benefit of comparison, I have run some essential steps without the PCA element.  
+All the steps and visualizations were not repeated (for brevity), but it felt important to have resutls to compare and see the benefit of PCA in numbers.
+All essential steps were repeated and you will find in the code.
+
+#### RF -- RGB
+##### TUNING, specs , wf
+
+with PCA, SMOTE/Downsampling Hybrid Method (+ tune_grid --\> tune_bayes)
+```{r, message=FALSE}
+# https://parsnip.tidymodels.org/reference/details_rand_forest_ranger.html
+
+# model specs
+rf_spec_pgh <- rand_forest(
+  trees = tune(),  # default 500
+  mtry = tune(),   # default floor(sqrt(ncol(x)))
+  min_n = tune(),  # default 10 in classification 
+) %>% 
+  set_engine("ranger") %>% 
+  set_mode("classification") %>% 
+  translate()
+
+# define workflow
+rf_pgh_wf <- workflow() %>% 
+  add_recipe(recipe_hybrid_pca_rgb) %>% 
+  add_model(rf_spec_pgh)
+
+# tuning RF model parameters
+tune_params_pgh_rf <- extract_parameter_set_dials(rf_pgh_wf) %>% 
+  update(
+    trees = trees(range = c(50, 500)), 
+    mtry = mtry(range = c(1,3)),  # only three parameters (mtry=3 would be bagged trees)
+    min_n = min_n(range = c(1,75)),
+    num_comp = num_comp(range = c(1,22))
+  )
+
+# RF tuning results HYBRID-BAYES-PCA
+set.seed(3)
+tune_results_1_rf <- tune_grid(
+  rf_pgh_wf,
+  resamples = resamples, 
+  control = cv_control, 
+  grid = grid_random(tune_params_pgh_rf, size = 25)
+)
+
+tune_results_2_rf <- tune_bayes(
+  rf_pgh_wf,
+  resamples = resamples, 
+  control = control_bayes(verbose = TRUE), # bayes needs control_bayes() obj!!
+  param_info = tune_params_pgh_rf,
+  initial = tune_results_1_rf,
+  iter = 30
+)
+```
+
+```{r}
+autoplot(tune_results_2_rf, size = 1)
+```
+
+```{r}
+# best parameters
+best_params_rfac_pgh <- show_best(tune_results_2_rf, metric = "accuracy", n=1)
+best_params_rfbr_pgh <- show_best(tune_results_2_rf, metric = "brier_class", n=1)
+best_params_rfroc_pgh <- show_best(tune_results_2_rf, metric = "roc_auc", n=1)
+
+best_params_all_rf_pgh <- bind_rows(best_params_rfac_pgh, best_params_rfbr_pgh, best_params_rfroc_pgh) %>% 
+  select(-.estimator, -n, -.config, -std_err)
+
+best_params_all_rf_pgh %>% 
+  kable(caption= "<center>RF Hyperparameter Values by Metric", digits = 4) %>% 
+  kableExtra::kable_styling(full_width = FALSE)
+```
+
+##### best hyperparameters:
+
+```{r}
+select_best(tune_results_2_rf, metric = "roc_auc") %>% 
+  kable(caption="<center>Best Hyperparameters for RF (pgh)") %>% 
+  kableExtra::kable_styling(full_width = FALSE)
+  
+```
+
+### RF -- EV
+##### TUNING, specs, wf
+```{r, message=FALSE}
+# model specs
+rf_spec_pgh <- rand_forest(
+  trees = tune(),  # default 500
+  mtry = tune(),   # default floor(sqrt(ncol(x)))
+  min_n = tune(),  # default 10 in classification 
+) %>% 
+  set_engine("ranger") %>% 
+  set_mode("classification") %>% 
+  translate()
+  
+rf_pca_hybrid_wf_ev <- workflow() %>% 
+  add_recipe(recipe_hybrid_pca_ev) %>% 
+  add_model(rf_spec_pgh)
+
+tune_params_rf_phg_ev <- extract_parameter_set_dials(rf_pgh_wf) %>% 
+  update(
+    trees = trees(range = c(50, 500)), 
+    mtry = mtry(range = c(1,3)),  # only three parameters (mtry=3 would be bagged trees)
+    min_n = min_n(range = c(1,75)),
+    num_comp = num_comp(range = c(1,22))
+  )
+
+set.seed(2)
+
+tune_results_1_rf_ev <- tune_grid(  
+  rf_pca_hybrid_wf_ev,
+  resamples = resamples_ev, 
+  control = cv_control, 
+  grid = grid_random(tune_params_rf_phg_ev, size = 25)
+)
+
+tune_results_2_rf_ev <- tune_bayes( 
+  rf_pca_hybrid_wf_ev,
+  resamples = resamples_ev, 
+  control = control_bayes(verbose = TRUE),
+  param_info = tune_params_rf_phg_ev,
+  initial = tune_results_1_rf_ev,
+  iter = 30
+)
+
+# tuning RF model parameters
+tune_params_pgh_rf <- extract_parameter_set_dials(rf_pgh_wf) %>% 
+  update(
+    trees = trees(range = c(50, 500)), 
+    mtry = mtry(range = c(1,3)),  # only three parameters (mtry=3 would be bagged trees)
+    min_n = min_n(range = c(1,75))
+  )
+
+# RF tuning results HYBRID-BAYES-PCA
+set.seed(3)
+tune_results_1_rf <- tune_grid(
+  rf_pgh_wf,
+  resamples = resamples, 
+  control = cv_control, 
+  grid = grid_random(tune_params_pgh_rf, size = 25)
+)
+
+tune_results_2_rf <- tune_bayes(
+  rf_pgh_wf,
+  resamples = resamples, 
+  control = control_bayes(verbose = TRUE), # bayes needs control_bayes() obj!!
+  param_info = tune_params_pgh_rf,
+  initial = tune_results_1_rf,
+  iter = 30
+)
+```
+
+```{r}
+autoplot(tune_results_2_rf_ev)
+```
+
+```{r}
+# best parameters
+best_params_rf_ev <- show_best(tune_results_2_rf_ev, metric = "roc_auc", n=6)
+best_params_rf_ev
+```
+
+##### best hyperparameters
+
+```{r}
+select_best(tune_results_2_rf_ev, metric = "roc_auc")%>% 
+  kable(caption="<center>Best Hyperparameters for RF (engineered variables)") %>% 
+  kableExtra::kable_styling(full_width = FALSE)
+```
+
+### FINALIZING MODELS WITH TUNING RESULTS
+
+##### finalizing KNN-RGB (hybrid + PCA)
+```{r}
+best_wf_knn_pgh <- knn_pca_hybrid_wf %>% 
+  finalize_workflow(select_best(tune_results_2_knn, metric = "roc_auc"))
+
+knn_pgh_cv_results <- fit_resamples(best_wf_knn_pgh, resamples, metrics = cv_metrics, control = cv_control)
+
+knn_pgh_preds <- collect_predictions(knn_pgh_cv_results)
+
+head(knn_pgh_preds, n=2)
+```
+
+```{r, fig.width = 3, fig.height=3}
+r1 <- knn_pgh_preds %>% 
+  roc_curve(truth=BT, .pred_TRUE, event_level = "first") %>% 
+  autoplot()+
+  labs(
+    title="KNN in RGB training", 
+    subtitle="with hybrid sampling + PCA")
+```
+
+##### finalizing KNN-EV (hybrid + PCA)
+
+```{r}
+best_wf_knn_pgh_ev <- knn_pca_hybrid_wf_ev %>% 
+  finalize_workflow(select_best(tune_results_2_knn_ev, metric = "roc_auc"))
+
+knn_pgh_cv_results_ev <- fit_resamples(best_wf_knn_pgh_ev, resamples_ev, metrics = cv_metrics, control = cv_control)
+
+knn_pgh_preds_ev <- collect_predictions(knn_pgh_cv_results_ev)
+
+head(knn_pgh_preds_ev, n=2)
+```
+
+```{r, fig.width = 3, fig.height=3}
+r3 <- knn_pgh_preds_ev %>% 
+  roc_curve(truth=BT, .pred_TRUE, event_level = "first") %>% 
+  autoplot()+
+  labs(
+    title="KNN on EV (engineered vars) training", 
+    subtitle="with hybrid sampling + PCA (test)")
+```
+
+##### finalizing RF-RGB (hybrid + PCA)
+
+```{r}
+best_wf_rf_pgh <- rf_pgh_wf %>% 
+  finalize_workflow(select_best(tune_results_2_rf, metric = "roc_auc"))
+
+rf_pgh_cv_results <- fit_resamples(best_wf_rf_pgh, resamples, metrics = cv_metrics, control = cv_control)
+
+rf_pgh_preds <- collect_predictions(rf_pgh_cv_results)
+
+head(rf_pgh_preds, n=2)
+```
+
+```{r, fig.width = 3, fig.height=3}
+r2 <- rf_pgh_preds %>% 
+  roc_curve(truth=BT, .pred_TRUE, event_level = "first") %>% 
+  autoplot()+
+  labs(
+    title="Random Forest in RGB training", 
+    subtitle="with hybrid sampling + PCA")
+```
+
+##### finalizing RF-EV (hybrid + PCA)
+```{r}
+best_wf_rf_pgh_ev <- rf_pca_hybrid_wf_ev%>% 
+  finalize_workflow(select_best(tune_results_2_rf_ev, metric = "roc_auc"))
+
+rf_pgh_cv_results_ev <- fit_resamples(best_wf_rf_pgh_ev, resamples_ev, metrics = cv_metrics, control = cv_control)
+
+rf_pgh_preds_ev <- collect_predictions(rf_pgh_cv_results_ev)
+
+head(rf_pgh_preds_ev, n=2)
+```
+
+```{r, fig.width = 3, fig.height=3}
+r4 <- rf_pgh_preds_ev %>% 
+  roc_curve(truth=BT, .pred_TRUE, event_level = "first") %>% 
+  autoplot()+
+  labs(
+    title="Random Forest on EV (engineered vars) training", 
+    subtitle="with hybrid sampling + PCA")
+```
+
+```{r}
+(r1 + r2) / (r3 + r4) 
+# / (r5 + r6)
+```
+
+#### FITTING KNN 
+##### -- RGB
+```{r}
+# fit tuned model on train
+fitmod_knn_phg <- best_wf_knn_pgh %>% 
+  fit(data = train_data)
+```
+##### -- EV
+```{r}
+fitmod_knn_phg_ev <- best_wf_knn_pgh_ev %>% 
+  fit(data = train_engineered)
+```
+
+#### KNN: THRESHOLD OPTIMIZATION
+##### The Formulas 
+**(adapted this code from Hai's part 1 code -- credit where due)**
+```{r}
+threshold_graph <- function(model_cv, model_name) {
+  performance <- probably::threshold_perf(
+    collect_predictions(model_cv),
+    truth = BT,
+    estimate = .pred_TRUE,
+    thresholds = seq(0.05, 0.95, 0.01),
+    event_level = "first",
+    metrics = metric_set(accuracy, precision, f_meas, kap)
+  )
+  
+  max_metrics <- performance %>% 
+    drop_na() %>% 
+    group_by(.metric) %>% 
+    filter(.estimate == max(.estimate))
+  
+  g <- ggplot(performance, aes(x = .threshold, y = .estimate, color = .metric)) +
+    geom_line() +
+    geom_point(data = max_metrics, color = "black") +
+    labs(title = model_name, x = "Threshold", y = "Metric value") +
+    coord_cartesian(ylim = c(0.5, 1.0))
+  
+  thresholds <- max_metrics %>%
+    select(.metric, threshold = .threshold) %>%
+    deframe()
+  
+  return(list(graph = g, thresholds = thresholds))
+}
+```
+
+```{r}
+visualize_conf_mat <- function(model_cv, thresholds, metric) {
+  threshold <- thresholds[metric]
+  cm <- collect_predictions(model_cv) %>% 
+    mutate(
+      .pred_class = make_two_class_pred(.pred_TRUE, levels = c("TRUE", "FALSE"), threshold = threshold)
+    ) %>% 
+    conf_mat(truth = BT, estimate = .pred_class)
+  
+  autoplot(cm, type = "heatmap") +
+    labs(title = sprintf("Threshold %.2f (%s)", threshold, metric))
+}
+```
+
+```{r}
+overview_model <- function(model_cv, model_name) {
+  tg <- threshold_graph(model_cv, model_name)
+  g1 <- visualize_conf_mat(model_cv, tg$thresholds, "accuracy")
+  g2 <- visualize_conf_mat(model_cv, tg$thresholds, "f_meas")
+  g3 <- visualize_conf_mat(model_cv, tg$thresholds, "precision")
+  
+  tg$graph + (g1 / g2 / g3)
+}
+```
+
+##### --RGB
+```{r}
+g1 <- overview_model(knn_pgh_cv_results, "KNN in RGB | PCA + hybrid samp.")
+
+# g1 = knn in rgb with pca + hybrid sampling
+g1
+```
+##### optimal threshold KNN in RGB
+```{r}
+probably::threshold_perf(collect_predictions(knn_pgh_cv_results), BT, .pred_TRUE, 
+                         thresholds = 0.87, event_level = "first", 
+                         metrics = metric_set(accuracy, precision, f_meas, kap)) |>
+  select(c(.metric, .estimate)) |>
+  pivot_wider(names_from = ".metric", values_from = ".estimate") |>
+  knitr::kable(caption = "<center>Performance metrics for the KNN model at threshold = 0.87", digits =4) %>% 
+  kableExtra::kable_styling(full_width = FALSE)
+                         
+```
+
+##### --EV
+
+```{r}
+g2 <- overview_model(knn_pgh_cv_results_ev, "KNN with EV | PCA + hybrid samp.")
+
+g2
+```
+
+##### optimal threshold KNN with EV
+```{r}
+probably::threshold_perf(collect_predictions(knn_pgh_cv_results_ev), BT, .pred_TRUE, 
+                         thresholds = 0.56, event_level = "first", 
+                         metrics = metric_set(accuracy, precision, f_meas, kap)) |>
+  select(c(.metric, .estimate)) |>
+  pivot_wider(names_from = ".metric", values_from = ".estimate") |>
+  knitr::kable(caption = "<center>Performance metrics for the KNN model at threshold = 0.56", digits =4) %>% 
+  kableExtra::kable_styling(full_width = FALSE)
+```
+
+#### FITTING RF
+##### -- RGB
+```{r}
+# fit tuned model on train
+fitmod_rf_phg <- best_wf_rf_pgh %>% 
+  fit(data = train_data)
+```
+##### --EV
+```{r}
+# fit tuned model on ev-train
+fitmod_rf_phg_ev <- best_wf_rf_pgh_ev %>% 
+  fit(data = train_engineered)
+```
+
+#### RF: THRESHOLD OPTIMIZATION
+##### -- RGB
+```{r}
+# RGB
+g3 <- overview_model(rf_pgh_cv_results, "RF in RGB")
+g3
+```
+
+##### optimal threshold RF in RBG
+```{r}
+probably::threshold_perf(collect_predictions(rf_pgh_cv_results_ev), BT, .pred_TRUE, 
+                         thresholds = 0.82, event_level = "first", 
+                         metrics = metric_set(accuracy, precision, f_meas, kap)) |>
+  select(c(.metric, .estimate)) |>
+  pivot_wider(names_from = ".metric", values_from = ".estimate") |>
+  knitr::kable(caption = "<center>Performance metrics for the KNN model in RBG at threshold = 0.82", digits =5) %>% 
+  kableExtra::kable_styling(full_width = FALSE)
+                         
+```
+
+##### -- EV
+```{r}
+# RGB
+g4 <- overview_model(rf_pgh_cv_results_ev, "RF on EV")
+g4
+```
+
+##### optimal threshold RF with EV
+```{r}
+probably::threshold_perf(collect_predictions(rf_pgh_cv_results_ev), BT, .pred_TRUE, 
+                         thresholds = 0.79, event_level = "first", 
+                         metrics = metric_set(accuracy, precision, f_meas, kap)) |>
+  select(c(.metric, .estimate)) |>
+  pivot_wider(names_from = ".metric", values_from = ".estimate") |>
+  knitr::kable(caption = "<center>Performance metrics for the KNN model with EV at threshold = 0.79", digits =5) %>% 
+  kableExtra::kable_styling(full_width = FALSE)
+                         
+```
+
+### Performance TESTING
+```{r}
+# Predict classes at a given threshold
+predict_at_threshold <- function(model, data, threshold) {
+  model %>%
+    augment(data) %>%
+    mutate(.pred_class = make_two_class_pred(.pred_TRUE, c("TRUE", "FALSE"), threshold = threshold))
+}
+
+# Calculate accuracy and AUC for training and holdout sets
+calculate_metrics_at_threshold <- function(model, train, holdout, model_name, threshold) {
+  bind_rows(
+    # Accuracy on training set
+    bind_cols(
+      tibble(model = model_name, dataset = "train", threshold = threshold),
+      metrics(
+        predict_at_threshold(model, train, threshold),
+        truth = BT,
+        estimate = .pred_class
+      )
+    ),
+    
+    # AUC on training set
+    bind_cols(
+      tibble(model = model_name, dataset = "train", threshold = threshold),
+      roc_auc(
+        augment(model, new_data = train),
+        truth = BT,
+        .pred_TRUE,
+        event_level = "first"
+      )
+    ),
+    # F1 score on training set
+    bind_cols(
+      tibble(model = model_name, dataset = "train", threshold = threshold),
+      f_meas(
+        predict_at_threshold(model, train, threshold),
+        truth = BT, 
+        estimate = .pred_class, 
+        event_level = "first"
+      )
+    ),
+    
+    # Accuracy on holdout set
+    bind_cols(
+      tibble(model = model_name, dataset = "holdout", threshold = threshold),
+      metrics(
+        predict_at_threshold(model, holdout, threshold),
+        truth = BT,
+        estimate = .pred_class
+      )
+    ),
+    
+    # AUC on holdout set
+    bind_cols(
+      tibble(model = model_name, dataset = "holdout", threshold = threshold),
+      roc_auc(
+        augment(model, new_data = holdout),
+        truth = BT,
+        .pred_TRUE,
+        event_level = "first"
+      )
+    ),
+        # F1 score on holdout set
+    bind_cols(
+      tibble(model = model_name, dataset = "holdout", threshold = threshold),
+      f_meas(
+        predict_at_threshold(model, holdout, threshold),
+        truth = BT, 
+        estimate = .pred_class, 
+        event_level = "first"
+    ),
+  )
+)
+}
+```
+
+#### Renaming Models
+```{r}
+# fit models(renaming)
+knn_rgb <- fitmod_knn_phg
+knn_ev <- fitmod_knn_phg_ev
+
+rf_rgb <- fitmod_rf_phg
+rf_ev <- fitmod_rf_phg_ev
+```
+
+##### opti thresh
+```{r}
+# assigning optimal thresholds KNN
+opt_thresh_knn_rgb <- 0.87
+opt_thresh_knn_ev <- 0.56
+# assigning optimal thresholds for RF
+opt_thresh_rf_rgb <- 0.82
+opt_thresh_rf_ev <- 0.79
+```
+
+```{r}
+# calculating final performance metrics for KNN
+knn_metrics_rgb <- calculate_metrics_at_threshold(knn_rgb, train_data, strat_holdout_sample, "KNN in RGB (PCA + hybrid)", opt_thresh_knn_rgb)
+knn_metrics_ev <- calculate_metrics_at_threshold(knn_ev, train_engineered, holdout_engineered, "KNN with EV (PCA + hybrid)", opt_thresh_knn_ev)
+```
+
+```{r}
+knn_metrics_rgb
+```
+
+```{r}
+# calculating final performance metrics for RF 
+rf_metrics_rgb <- calculate_metrics_at_threshold(rf_rgb, train_data, strat_holdout_sample, "RF in RGB (PCA + hybrid)", opt_thresh_rf_rgb)
+rf_metrics_ev <- calculate_metrics_at_threshold(rf_ev, train_engineered, holdout_engineered, "RF with EV (PCA + hybrid)", opt_thresh_rf_ev)
+```
+
+#### FULL RESULTS TABLE
+```{r}
+metrics_table <- function(all_metrics, caption) {
+  all_metrics %>% 
+    pivot_wider(names_from=.metric, values_from = .estimate) %>% 
+    select(-.estimator) %>% 
+    knitr::kable(caption=caption, digits=5)
+}
+
+metrics_at_threshold <- bind_rows(
+  knn_metrics_rgb, 
+  knn_metrics_ev,
+  rf_metrics_rgb,
+  rf_metrics_ev
+) %>% arrange(dataset)
+
+tuned_metrics_table <- metrics_table(metrics_at_threshold, "<center>Performance Metrics at Optimal Thresholds (optimized for train)") %>% 
+  kableExtra::kable_styling(full_width = FALSE)%>%
+  kableExtra::collapse_rows(columns = 1:2, valign = "top")
+
+tuned_metrics_table
+
+```
+
+```{r}
+#install.packages("magick")
+library(magick)
+save_kable(tuned_metrics_table, file = "tuned_metrics_table_knn_rf_comb.png", zoom = 2)
+```
+
+#### KNN-only RESULTS TABLE 
+```{r}
+# only KNN Table
+knn_metrics_at_threshold <- bind_rows(
+  knn_metrics_rgb, 
+  knn_metrics_ev
+) %>% arrange(dataset)
+
+tuned_knn_results_va <- metrics_table(knn_metrics_at_threshold, "<center>Performance Metrics at Optimal Thresholds for Tuned KNN with PCA and hybrid sampling") %>% 
+  kableExtra::kable_styling(full_width = FALSE)%>%
+  kableExtra::collapse_rows(columns = 1:2, valign = "top")
+
+tuned_knn_results_va
+
+save_kable(tuned_knn_results_va, file = "tuned_knn_results_va.png", zoom = 2)
+```
+
+### CONFUSION MATRIX RESULTS KNN
+#### -- RGB
+```{r}
+create_confusion_matrix <- function(model, data, threshold, title = NULL) {
+  predictions <- predict_at_threshold(model, data, threshold)
+  conf_mat <- conf_mat(predictions, truth = BT, estimate = .pred_class)
+  plot <- conf_mat %>%
+    autoplot(type = "heatmap") +
+    ggtitle(title)
+  list(conf_mat = conf_mat, plot = plot)
+}
+# For training data
+# KNN in RGB
+cm_knn_rgb_train <- create_confusion_matrix(knn_rgb, train_data, 0.87, "KNN in RGB (PCA +) at Threshold 0.87 - Training")
+print(cm_knn_rgb_train$conf_mat)  
+cm_knn_rgb_train$plot             
+
+# For 0.2 strat random sampke f holdout data
+cm_knn_ev_holdsamp <- create_confusion_matrix(knn_ev, strat_holdout_sample, 0.56, "KNN in EV (PCA +) at Threshold 0.56 - 0.2 Holdout")
+print(cm_knn_ev_holdsamp$conf_mat)
+cm_knn_ev_holdsamp$plot
+```
+
+
+### RF RESULTS TABLE
+#### RF results with PCA
+```{r}
+# only RF Table
+rf_metrics_at_threshold <- bind_rows(
+  rf_metrics_rgb,
+  rf_metrics_ev
+) %>% arrange(dataset)
+
+tuned_rf_results_va <- metrics_table(rf_metrics_at_threshold, "<center>Performance Metrics at Optimal Thresholds (calculated on train) for Tuned Random Forest with PCA and hybrid sampling") %>% 
+  kableExtra::kable_styling(full_width = FALSE)%>%
+  kableExtra::collapse_rows(columns = 1:2, valign = "top")
+
+save_kable(tuned_rf_results_va, file = "tuned_rf_results_va.png", zoom = 2)
+tuned_rf_results_va
+```
+
+### CONFUSION MATRIX RESULTS RF
+#### RF results with PCA
+##### with PCA
+```{r}
+# Function to create a confusion matrix for a model
+create_confusion_matrix <- function(model, data, threshold, title = NULL) {
+  # Get predictions at the specified threshold
+  predictions <- predict_at_threshold(model, data, threshold)
+  
+  # Create the confusion matrix
+  conf_mat <- conf_mat(predictions, truth = BT, estimate = .pred_class)
+  
+  # Plot with ggplot2 (optional but nice visualization)
+  plot <- conf_mat %>%
+    autoplot(type = "heatmap") +
+    ggtitle(title)
+  
+  # Return both the confusion matrix object and the plot
+  list(conf_mat = conf_mat, plot = plot)
+}
+################################################################################
+# For training data
+# RF in RGB
+cm_rf_rgb_train <- create_confusion_matrix(rf_rgb, train_data, 0.82, "Random Forest in RGB (PCA +) at Threshold 0.82 - Training")
+print(cm_rf_rgb_train$conf_mat)  # Prints the confusion matrix counts
+cm_rf_rgb_train$plot             # Displays the plot
+
+# For 0.2 strat random sampke f holdout data
+cm_rf_rgb_holdsamp <- create_confusion_matrix(rf_rgb, strat_holdout_sample, 0.82, "Random Forest in RGB (PCA +) at Threshold 0.82 - 0.2 Holdout")
+print(cm_rf_rgb_holdsamp$conf_mat)
+cm_rf_rgb_holdsamp$plot
+
+# Claude Sonnet helped with this code
+```
+
+```{r}
+# For full holdout data
+cm_rf_rgb_holdfull <- create_confusion_matrix(rf_rgb, holdout_engineered, 0.82, "Random Forest in RGB (PCA +) at Opt. Thresh. (0.82) - Holdout")
+print(cm_rf_rgb_holdfull$conf_mat)
+cm_rf_rgb_holdfull$plot
+```
+
+```{r}
+stopCluster(cl)
+registerDoSEQ()
+```
+
+
+
+## KNN Analysis (Hai Liu)
+
+```{r parallel}
+#| cache: FALSE
+#| message: FALSE
+# Parallel Processing Setup and Package Loading
+library(doParallel)
+cl <- makePSOCKcluster(parallel::detectCores(logical = FALSE) - 2)
+registerDoParallel(cl)
+```
+```{r libraries}
+#| cache: FALSE
+#| warning: FALSE
+#| message: FALSE
+library(tidyverse)
+library(tidymodels)
+library(discrim)
+library(jpeg)
+library(patchwork)
+library(probably)
+library(gridExtra)
+library(plotly)
+library(kableExtra)
+library(themis)
+```
+
+### Data loading and wrangling
+```{r}
+# Use Clay Harris' data sets with all engineered features features in different color spaces
+train_data <- readRDS("./train_data.rds")
+holdout_data <- readRDS("./holdout_data.rds") %>% drop_na()
+ 
+```
+
+### Settings for Modelling
+```{r}
+set.seed(6030)
+
+resamples <- vfold_cv(train_data, v=10, strata=BT)
+cv_metrics <- metric_set(accuracy, precision, f_meas, roc_auc)
+cv_control <- control_resamples(save_pred=TRUE)
+```
+
+### Build and tune the k-nearest neighbors in RGB
+```{r}
+#| warning: FALSE
+
+# RGB Model Formula and Recipe
+rgb_formula <- BT ~ Red + Green + Blue
+rgb_recipe <- recipe(rgb_formula, data = train_data)
+
+knn_rgb_wf <- workflow() %>%
+    add_recipe(rgb_recipe) %>%
+    add_model(nearest_neighbor(engine="kknn",
+                               mode="classification",
+                               neighbors=tune()))
+```
+
+```{r}
+parameters <- extract_parameter_set_dials(knn_rgb_wf) %>%
+  update(neighbors = neighbors(c(1, 200)))
+
+tune_knn_rgb <- tune_grid(knn_rgb_wf,
+                      resamples=resamples,
+                      control=cv_control,
+                      grid=grid_regular(parameters, levels=50))
+
+autoplot(tune_knn_rgb)
+
+```
+
+
+```{r}
+tune_knn_rgb2 <- tune_bayes(knn_rgb_wf,
+                            resamples=resamples,
+                            param_info=parameters,
+                            iter=25)
+
+autoplot(tune_knn_rgb2)
+```
+
+```{r}
+parameters <- extract_parameter_set_dials(knn_rgb_wf) %>%
+  update(neighbors = neighbors(c(25, 135)))
+
+tune_knn_rgb3 <- tune_grid(knn_rgb_wf,
+                      resamples=resamples,
+                      control=cv_control,
+                      grid=grid_regular(parameters, levels=50))
+
+autoplot(tune_knn_rgb3)
+```
+
+```{r}
+tune_knn_rgb4 <- tune_bayes(knn_rgb_wf,
+                            resamples=resamples,
+                            param_info=parameters,
+                            iter=25)
+
+autoplot(tune_knn_rgb4)
+```
+
+```{r}
+show_best(tune_knn_rgb3, metric="roc_auc", n=3)
+```
+```{r}
+show_best(tune_knn_rgb4, metric="roc_auc", n=3)
+```
+
+```{r}
+parameters <- extract_parameter_set_dials(knn_rgb_wf) %>%
+  update(neighbors = neighbors(c(30, 50)))
+
+tune_knn_rgb5 <- tune_grid(knn_rgb_wf,
+                      resamples=resamples,
+                      control=cv_control,
+                      grid=grid_regular(parameters, levels=20))
+
+autoplot(tune_knn_rgb5)
+```
+```{r}
+show_best(tune_knn_rgb5, metric="roc_auc", n=3)
+```
+
+### Evaluate the tuned k-nearest neighbor model using 10-fold cross validation.
+```{r}
+best_knn_rgb_cv <- knn_rgb_wf %>%
+  finalize_workflow(select_best(tune_knn_rgb5, metric="roc_auc")) %>%
+  fit_resamples(resamples, metrics=cv_metrics, control=cv_control)
+```
+
+```{r}
+collect_metrics(best_knn_rgb_cv) %>% mutate(model="KNN")%>%
+  select(model, .metric, mean) %>%
+  pivot_wider(names_from = .metric, values_from = mean) %>%
+  knitr::kable(caption="Cross-validation metrics for KNN RGB model", digits=3)
+```
+
+```{r}
+collect_predictions(best_knn_rgb_cv) %>% mutate(model = "KNN") %>%
+  roc_curve(truth = BT, .pred_TRUE, event_level = "first") %>%
+  autoplot() +
+  ggtitle("ROC Curve - KNN RGB Model with 10-Fold CV")
+```
+
+### Threshold Selection and Optimization with CV
+```{r}
+threshold_graph_from_cv <- function(model_cv, model_name) {
+    performance <- probably::threshold_perf(collect_predictions(model_cv), 
+                                            truth=BT, 
+                                            estimate=.pred_TRUE,
+                                            thresholds=seq(0.01, 0.99, 0.01), 
+                                            event_level="first",
+                                            metrics=metric_set(f_meas, accuracy, sens)
+                                            )
+    
+    max_metrics <- performance %>%
+        drop_na() %>%
+        group_by(.metric) %>%
+        filter(.estimate == max(.estimate))
+    
+    opti_thresholds <- max_metrics %>%
+        select(.metric, .threshold) %>%
+        deframe()
+    
+    graph <- ggplot(performance, aes(x=.threshold, y=.estimate, color=.metric)) +
+        geom_line() +
+        geom_point(data=max_metrics, color="black") +
+        labs(title=model_name, x="Threshold", y="Metric value") +
+        coord_cartesian(ylim=c(0, 1))
+    
+    return(list(opti_thresholds=opti_thresholds, graph=graph))
+}
+
+visualize_conf_mat <- function(model_cv, opti_thresholds, metric) {
+    threshold <- opti_thresholds[metric]
+    cm <- collect_predictions(model_cv) %>%
+        mutate(
+            .pred_class = make_two_class_pred(.pred_TRUE, c("TRUE", "FALSE"), threshold=threshold),
+        ) %>%
+        conf_mat(truth=BT, estimate=.pred_class)
+    autoplot(cm, type="heatmap") +
+        labs(title=sprintf("Threshold %.2f (%s)", threshold, metric))
+}
+
+overview_model <- function(model_cv, model_name) {
+    tg <- threshold_graph_from_cv(model_cv, model_name)
+    g1 <- visualize_conf_mat(model_cv, tg$opti_thresholds, "accuracy")
+    g2 <- visualize_conf_mat(model_cv, tg$opti_thresholds, "f_meas")
+    g3 <- visualize_conf_mat(model_cv, tg$opti_thresholds, "sens")
+    tg$graph + (g1 / g2 / g3)
+}
+```
+
+```{r}
+overview_model(best_knn_rgb_cv, "KNN")
+```
+
+### Fit a Final KNN Model and Evaluate with the Holdout Set
+```{r}
+final_knn_rgb <- knn_rgb_wf %>%
+  finalize_workflow(select_best(tune_knn_rgb5, metric="roc_auc")) %>%
+  fit(data = train_data)
+```
+```{r}
+# Tuned model CV predictions
+cv_preds <- collect_predictions(best_knn_rgb_cv) %>%
+  mutate(source = "training_CV")
+
+# Final model prediction
+holdout_preds <- augment(final_knn_rgb, new_data = holdout_data) %>%
+    mutate(source = "holdout")
+
+# Compute ROC
+roc_data <- bind_rows(cv_preds, holdout_preds) %>%
+    group_by(source) %>%
+    roc_curve(truth = BT, .pred_TRUE, event_level = "first")
+```
+```{r}
+# Use autoplot
+autoplot(roc_data) +
+  ggtitle("ROC Curve - KNN RGB Models") +
+  theme_minimal()
+```
+
+
+### Threshold Selection for Final Models with Holdout Set
+```{r}
+# Find the optimal threshold
+threshold_graph_final_model <- function(final_model, data, model_name) {
+    performance <- probably::threshold_perf(augment(final_model, data),
+                                            truth = BT,
+                                            estimate = .pred_TRUE,
+                                            thresholds = seq(0.01, 0.99, 0.01),
+                                            event_level = "first",
+                                            metrics = metric_set(f_meas)
+                                           )
+    
+    max_metrics <- performance %>%
+        drop_na() %>%
+        group_by(.metric) %>%
+        filter(.estimate == max(.estimate))
+    
+    opt_thresholds <- max_metrics %>%
+        select(.metric, .threshold) %>%
+        deframe()
+    
+    graph <- ggplot(performance, aes(x=.threshold, y=.estimate, color=.metric)) +
+        geom_line() +
+        geom_point(data=max_metrics, color="black") +
+        labs(title=model_name, x="Threshold", y="Metric value") +
+        coord_cartesian(ylim=c(0, 1))
+    
+    return(list(graph=graph, 
+                opt_thresholds=opt_thresholds, 
+                model_name=model_name))
+}
+```
+
+```{r}
+final_knn_rgb_threshold_holdout <- threshold_graph_final_model(final_knn_rgb,
+                                                               holdout_data,
+                                                               "k-nearest neighbor")
+final_knn_rgb_threshold_holdout$graph
+```
+
+```{r}
+final_knn_rgb_threshold_holdout$opt_thresholds['f_meas']
+```
+
+
+## Calculate Metrics at Optimal Thresholds
+```{r}
+# Two helper functions
+predict_at_threshold <- function(model, data, threshold) {
+  augment(model, data) %>%
+    mutate(
+      .pred_class = make_two_class_pred(.pred_TRUE, c("TRUE", "FALSE"), threshold = threshold)
+    )
+}
+
+calculate_metrics_at_threshold <- function(
+  model,
+  train,
+  holdout,
+  model_name,
+  color_space,
+  train_threshold,
+  holdout_threshold
+) {
+  
+  preds_at_thd_train <- predict_at_threshold(model, train, train_threshold)
+  preds_at_thd_holdout <- predict_at_threshold(model, holdout, holdout_threshold)
+
+  bind_rows(
+    # Metrics for the training set
+    bind_cols(
+      color_space = color_space,
+      model = model_name,
+      dataset = "train",
+      threshold = train_threshold,
+      metrics(preds_at_thd_train, truth = BT, estimate = .pred_class)
+    ),
+    # bind_cols(
+    #   color_space = color_space,
+    #   model = model_name,
+    #   dataset = "train",
+    #   threshold = train_threshold,
+    #   sens(preds_at_thd_train, truth = BT, estimate = .pred_class)
+    # ),
+    bind_cols(
+      color_space = color_space,
+      model = model_name,
+      dataset = "train",
+      threshold = train_threshold,
+      f_meas(preds_at_thd_train, truth = BT, estimate = .pred_class)
+    ),
+    bind_cols(
+      color_space = color_space,
+      model = model_name,
+      dataset = "train",
+      threshold = train_threshold,
+      roc_auc(augment(model, train), truth = BT, .pred_TRUE, event_level = "first")
+    ),
+    
+    
+    # Metrics for the holdout set
+    bind_cols(
+      color_space = color_space,
+      model = model_name,
+      dataset = "holdout",
+      threshold = holdout_threshold,
+      metrics(preds_at_thd_holdout, truth = BT, estimate = .pred_class)
+    ),
+    bind_cols(
+      color_space = color_space,
+      model = model_name,
+      dataset = "holdout",
+      threshold = holdout_threshold,
+      f_meas(preds_at_thd_holdout, truth = BT, estimate = .pred_class)
+    ),
+    # bind_cols(
+    #   color_space = color_space,
+    #   model = model_name,
+    #   dataset = "holdout",
+    #   threshold = holdout_threshold,
+    #   sens(preds_at_thd_holdout, truth = BT, estimate = .pred_class)
+    # ),
+    bind_cols(
+      color_space = color_space,
+      model = model_name,
+      dataset = "holdout",
+      threshold = holdout_threshold,
+      roc_auc(augment(model, holdout), BT, .pred_TRUE, event_level = "first")
+    )
+  )
+}
+```
+
+```{r}
+calculate_metrics_at_threshold(
+    final_knn_rgb, train_data, holdout_data,
+    "k-nearest neighbor", "RGB",
+    0.58, 0.59) %>%
+  select(-.estimator) %>%
+  pivot_wider(names_from = .metric, values_from = .estimate) %>%
+  knitr::kable(caption="Performance metrics for tuned KNN model with optimal threshold", digits=3)
+```
+
+
+## Downsampling the train_data with SMOTE oversampling to address the unbalanced classes of response variable
+```{r}
+rgb_hybrid_recipe <- recipe(rgb_formula, data = train_data) %>%
+  step_downsample(BT, under_ratio = 6, seed = 6020) %>%  # Down-sample majority class, keeps 1 minority for every 6 majority
+  step_smote(BT, over_ratio = 0.33)   # Apply SMOTE to minority class
+
+knn_rgb_hybrid_wf <- workflow() %>%
+    add_recipe(rgb_hybrid_recipe) %>%
+    add_model(nearest_neighbor(engine="kknn", 
+                               mode="classification", 
+                               neighbors=tune()))
+```
+
+
+```{r}
+# Initial tuning from 1 to 200
+parameters <- extract_parameter_set_dials(knn_rgb_hybrid_wf) %>%
+  update(neighbors = neighbors(c(1, 200)))
+
+tune_knn_rgb_hybrid <- tune_grid(knn_rgb_hybrid_wf,
+                      resamples=resamples,
+                      control=cv_control,
+                      grid=grid_regular(parameters, levels=50))
+
+```
+
+```{r}
+# saving the model
+saveRDS(tune_knn_rgb_hybrid, file = "./tune_knn_rgb_hybrid.rda")
+```
+
+```{r}
+# tune_knn_rgb_hybrid <- readRDS("./tune_knn_rgb_hybrid.rda")
+autoplot(tune_knn_rgb_hybrid)
+```
+
+```{r}
+# Second tuning from 20 to 150
+parameters <- extract_parameter_set_dials(knn_rgb_hybrid_wf) %>%
+  update(neighbors = neighbors(c(20, 150)))
+
+tune_knn_rgb_hybrid2 <- tune_grid(knn_rgb_hybrid_wf,
+                      resamples=resamples,
+                      control=cv_control,
+                      grid=grid_regular(parameters, levels=50))
+
+autoplot(tune_knn_rgb_hybrid2)
+```
+
+```{r}
+# saving the model
+saveRDS(tune_knn_rgb_hybrid2, file = "./tune_knn_rgb_hybrid2.rda")
+```
+
+```{r}
+# tune_knn_rgb_hybrid2 <- readRDS("./tune_knn_rgb_hybrid2.rda")
+autoplot(tune_knn_rgb_hybrid2)
+```
+
+```{r}
+show_best(tune_knn_rgb_hybrid2, metric="roc_auc", n=5)
+```
+
+```{r}
+# Final tuning from 80 to 120
+parameters <- extract_parameter_set_dials(knn_rgb_hybrid_wf) %>%
+  update(neighbors = neighbors(c(80, 120)))
+
+tune_knn_rgb_hybrid3 <- tune_grid(knn_rgb_hybrid_wf,
+                      resamples=resamples,
+                      control=cv_control,
+                      grid=grid_regular(parameters, levels=40))
+
+```
+
+```{r}
+# saving the model
+saveRDS(tune_knn_rgb_hybrid3, file = "./tune_knn_rgb_hybrid3.rda")
+```
+
+```{r}
+# tune_knn_rgb_hybrid3 <- readRDS("./tune_knn_rgb_hybrid3.rda")
+autoplot(tune_knn_rgb_hybrid3)
+```
+
+```{r}
+show_best(tune_knn_rgb_hybrid3, metric="roc_auc", n=3)
+```
+
+
+## Evaluate the down-sampled tuned k-nearest neighbor model using 10-fold cross validation.
+```{r}
+# Fit back to original workflow without down-sampling or SMOTE
+best_knn_rgb_hybrid_cv <- knn_rgb_wf %>%
+  finalize_workflow(select_best(tune_knn_rgb_hybrid3, metric="roc_auc")) %>%
+  fit_resamples(resamples, metrics=cv_metrics, control=cv_control)
+
+# saving the model
+saveRDS(best_knn_rgb_hybrid_cv, file = "./best_knn_rgb_hybrid_cv.rda")
+```
+
+```{r}
+# best_knn_rgb_hybrid_cv <- readRDS("./best_knn_rgb_hybrid_cv.rda")
+
+collect_metrics(best_knn_rgb_hybrid_cv) %>% mutate(model="Tuned KNN DS&SMOTE Model")%>%
+  select(model, .metric, mean) %>%
+  pivot_wider(names_from = .metric, values_from = mean) %>%
+  knitr::kable(caption="Cross-validation metrics for KNN models by Down-sample&SMOTE", digits=3)
+```
+
+```{r}
+collect_predictions(best_knn_rgb_hybrid_cv) %>% mutate(model = "k-nearest neighbor DS&SMOTE") %>%
+  roc_curve(truth = BT, .pred_TRUE, event_level = "first") %>%
+  autoplot() +
+  ggtitle("ROC Curve - KNN RGB Model with DS&SMOTE")
+```
+
+```{r}
+overview_model(best_knn_rgb_hybrid_cv, "KNN with DS&SMOTE")
+```
+
+```{r}
+# finalizing the model with full training data
+final_knn_rgb_hybrid <- knn_rgb_wf %>%
+  finalize_workflow(select_best(tune_knn_rgb_hybrid3, metric="roc_auc")) %>%
+  fit(data = train_data)
+
+# saving the model
+saveRDS(final_knn_rgb_hybrid, file = "./final_knn_rgb_hybrid.rda")
+```
+
+```{r}
+# final_knn_rgb_hybrid <- readRDS("./final_knn_rgb_hybrid.rda")
+```
+
+```{r}
+# Tuned model CV predictions
+cv_preds <- collect_predictions(best_knn_rgb_hybrid_cv) %>%
+  mutate(source = "training_CV")
+
+# Final model prediction
+holdout_preds <- augment(final_knn_rgb_hybrid, new_data = holdout_data) %>%
+  mutate(source = "holdout")
+
+# Compute ROC
+knn_rgb_hybrid_roc_data <- bind_rows(cv_preds, holdout_preds) %>%
+    group_by(source) %>%
+    roc_curve(truth = BT, .pred_TRUE, event_level = "first")
+
+saveRDS(knn_rgb_hybrid_roc_data, file = "./knn_rgb_hybrid_roc_data.rda")
+```
+
+```{r}
+# overlay the ROC curves from CV and holdout data
+
+# knn_rgb_hybrid_roc_data <- readRDS("./knn_rgb_hybrid_roc_data.rda")
+
+autoplot(knn_rgb_hybrid_roc_data) +
+  ggtitle("k-nearest neighbor after DS&SMOTE") +
+  theme_minimal()
+```
+
+
+```{r}
+# Find and plot the optimal threshold for Holdout Set based on f_meas
+final_knn_rgb_hybrid_threshold_holdout <- threshold_graph_final_model(final_knn_rgb_hybrid,
+                                                         holdout_data,
+                                                         "KNN after DS&SMOTE")
+saveRDS(final_knn_rgb_hybrid_threshold_holdout, file = "./final_knn_rgb_hybrid_threshold_holdout.rda")
+```
+
+```{r}
+# final_knn_rgb_hybrid_threshold_holdout <- readRDS("./final_knn_rgb_hybrid_threshold_holdout.rda")
+final_knn_rgb_hybrid_threshold_holdout$graph
+```
+
+```{r}
+final_knn_rgb_hybrid_threshold_holdout$opt_thresholds['f_meas']
+```
+
+```{r}
+# Calculate Metrics at the Optimal Thresholds
+calculate_metrics_at_threshold(
+    final_knn_rgb_hybrid, train_data, holdout_data,
+    "k-nearest neighbor after DS&SMOTE", "RGB",
+    0.49, 0.64) %>%
+  select(-.estimator) %>%
+  pivot_wider(names_from = .metric, values_from = .estimate) %>%
+  knitr::kable(caption="Performance metrics for tuned KNN model after DS&SMOTE with optimal threshold", digits=3)
+```
+
+
+### Build and Tune a KNN Model with All Engineered Features
+```{r}
+#| warning: FALSE
+
+# KNN Model Formula, Recipe, and Workflow with All Features
+all_formula <- BT ~ Red + Green + Blue + Luminance + a + b + Hue + Saturation + Value + Red_Prop + Green_Prop + Blue_Prop + Dispersion + Hue_Shifted + Red_9 + Green_9 + Blue_9 + Luminance_9 + a_9 + b_9 + Hue_9 + Saturation_9 + Value_9 + Red_Prop_9 + Green_Prop_9 + Blue_Prop_9 + Dispersion_9 + Hue_Shifted_9
+
+all_recipe <- recipe(all_formula, data = train_data) %>%  
+  step_normalize(all_numeric_predictors()) %>% 
+  step_pca(all_numeric_predictors(), num_comp=tune())
+
+# RUS and SMOTE for Model Tuning
+all_hybrid_recipe <- recipe(all_formula, data = train_data) %>%
+  step_downsample(BT, under_ratio = 6, seed = 6020) %>%  # RUS majority class, keeps 1 minority for every 6 majority
+  step_smote(BT, over_ratio = 0.33) %>%    # Apply SMOTE to minority class
+  step_normalize(all_numeric_predictors()) %>% 
+  step_pca(all_numeric_predictors(), num_comp=tune())
+
+knn_all_hybrid_wf <- workflow() %>%
+    add_recipe(all_hybrid_recipe) %>%
+    add_model(nearest_neighbor(engine="kknn", 
+                               mode="classification", 
+                               neighbors=tune()))
+
+knn_all_wf <- workflow() %>%
+    add_recipe(all_recipe) %>%
+    add_model(nearest_neighbor(engine="kknn",
+                               mode="classification",
+                               neighbors=tune()))
+```
+
+```{r}
+# Initial tuning from 1 to 200
+parameters <- extract_parameter_set_dials(knn_all_hybrid_wf) %>%
+  update(neighbors = neighbors(c(1, 200)))
+
+tune_knn_all_hybrid1 <- tune_bayes(knn_all_hybrid_wf,
+                      resamples=resamples,
+                      param_info=parameters, iter=25)
+
+saveRDS(tune_knn_all_hybrid1, file = "./tune_knn_all_hybrid1.rda")
+```
+
+
+```{r}
+# tune_knn_all_hybrid1 <- readRDS("./tune_knn_all_hybrid1.rda")
+autoplot(tune_knn_all_hybrid1)
+```
+
+```{r}
+show_best(tune_knn_all_hybrid1, metric="roc_auc", n=3)
+```
+
+
+## Evaluate the KNN Model (All Features) with 10-fold CV.
+```{r}
+# Fit the model with the workflow without RUS&SMOTE
+best_knn_all_cv <- knn_all_wf %>%
+  finalize_workflow(select_best(tune_knn_all_hybrid1, metric="roc_auc")) %>%
+  fit_resamples(resamples, metrics=cv_metrics, control=cv_control)
+
+# saving the model
+saveRDS(best_knn_all_cv, file = "./best_knn_all_cv.rda")
+```
+
+```{r}
+# best_knn_all_cv <- readRDS("./best_knn_all_cv.rda")
+
+collect_metrics(best_knn_all_cv) %>% mutate(model="Tuned KNN with All Predictors")%>%
+  select(model, .metric, mean) %>%
+  pivot_wider(names_from = .metric, values_from = mean) %>%
+  knitr::kable(caption="Cross-validation metrics for KNN model with all predictors", digits=3)
+```
+
+
+## Threshold Selection for the KNN Model (All Features) with 10-fold CV.
+```{r}
+overview_model(best_knn_all_cv, "Tuned KNN with All Predictors")
+```
+
+
+## Tuned KNN Model (All Features) Threshold and Performance on Holdout/Test Data
+```{r}
+# finalizing the model with full training data
+final_knn_all <- knn_all_wf %>%
+  finalize_workflow(select_best(tune_knn_all_hybrid1, metric="roc_auc")) %>%
+  fit(data = train_data)
+
+# saving the model
+saveRDS(final_knn_all, file = "./final_knn_all.rda")
+```
+
+```{r}
+# final_knn_all <- readRDS("./final_knn_all.rda")
+```
+
+```{r}
+# Tuned model CV predictions
+cv_preds <- collect_predictions(best_knn_all_cv) %>%
+  mutate(source = "training_CV")
+
+# Final model prediction
+holdout_preds <- augment(final_knn_all, new_data = holdout_data) %>%
+  mutate(source = "holdout")
+
+# Compute ROC
+knn_all_roc_data <- bind_rows(cv_preds, holdout_preds) %>%
+    group_by(source) %>%
+    roc_curve(truth = BT, .pred_TRUE, event_level = "first")
+
+saveRDS(knn_all_roc_data, file = "./knn_all_roc_data.rda")
+```
+
+```{r}
+# Overlay the ROC Curves from CV and Holdout Data for RGB and All-feature Spaces
+
+# knn_all_roc_data <- readRDS("./knn_all_roc_data.rda")
+
+knn_rgb_all_roc_data <- bind_rows(knn_rgb_hybrid_roc_data %>% mutate(color_space="RGB"), 
+                                  knn_all_roc_data %>% mutate(color_space="All Predictors"))
+
+g_knn_all <- knn_rgb_all_roc_data %>% 
+  ggplot(aes(x=1 - specificity, y=sensitivity, color=color_space)) +
+    geom_line(aes(linetype = source))+
+    ggtitle("Tuned KNN Models with Different Feature Spaces") #+ theme_minimal()
+
+g_knn_all
+```
+
+```{r}
+g_knn_all_zoom <- g_knn_all +
+coord_cartesian(xlim=c(0, 0.2), ylim=c(0.8, 1)) +
+guides(colour="none")
+
+g_knn_all_zoom
+```
+
+```{r}
+# Find and plot the optimal threshold for Holdout Set based on f_meas
+final_knn_all_threshold_holdout <- threshold_graph_final_model(final_knn_all,
+                                                         holdout_data,
+                                                         "KNN All Features")
+saveRDS(final_knn_all_threshold_holdout, file = "./final_knn_all_threshold_holdout.rda")
+```
+
+```{r}
+# final_knn_all_threshold_holdout <- readRDS("./final_knn_all_threshold_holdout.rda")
+final_knn_all_threshold_holdout$graph
+```
+
+```{r}
+final_knn_all_threshold_holdout$opt_thresholds['f_meas']
+```
+
+```{r}
+# Calculate Metrics at the Optimal Thresholds
+
+# Calculate with full holdout appear to be too resource demanding to run successfully,
+# only use a 20% stratified sample of the holdout as recommended by Virginia Brame.
+holdout_stratsample <- holdout_data %>%
+  na.omit() %>%
+  group_by(BT) %>%
+  sample_frac(size = 0.2)
+
+metrics_knn_all <- calculate_metrics_at_threshold(
+    final_knn_all, train_data, holdout_stratsample,
+    "k-nearest neighbor", "All Predictors", 0.49, 0.99) %>% select(-.estimator)
+
+saveRDS(metrics_knn_all, file = "./metrics_knn_all.rda")
+```
+
+```{r}
+# metrics_knn_all = readRDS("./metrics_knn_all.rda")
+
+metrics_knn_all %>%
+  pivot_wider(names_from = .metric, values_from = .estimate) %>%
+  knitr::kable(caption="Performance metrics for tuned KNN models at optimal thresholds in all feature space", digits=3)
+
+```
+
+
+
+## Support Vector Machines (SVM) Analysis (Hai Liu)
+### SVM - linear kernel (RGB)
+```{r}
+#| message: FALSE
+#| warning: FALSE
+
+svm_rgb_linear_hybrid_wf <- workflow() %>%
+  add_recipe(rgb_hybrid_recipe) %>%
+  add_model(svm_linear(mode="classification",
+                         engine="kernlab",
+                         cost=tune(),
+                         margin=tune()))
+
+parameters <- extract_parameter_set_dials(svm_rgb_linear_hybrid_wf)
+
+tune_svm_rgb_linear <- tune_bayes(svm_rgb_linear_hybrid_wf,
+                                  resamples=resamples,
+                                  param_info=parameters, iter=25)
+
+autoplot(tune_svm_rgb_linear)
+
+```
+
+```{r}
+show_best(tune_svm_rgb_linear, metric="roc_auc", n=3)
+```
+```{r}
+# saving the model
+saveRDS(tune_svm_rgb_linear, file = "./tune_svm_rgb_linear.rda")
+```
+
+```{r}
+# tune_svm_rgb_linear = readRDS("./tune_svm_rgb_linear.rda")
+show_best(tune_svm_rgb_linear, metric="roc_auc", n=3)
+```
+
+### SVM - linear kernel (All Features)
+```{r}
+#| message: FALSE
+#| warning: FALSE
+
+svm_all_linear_hybrid_wf <- workflow() %>%
+  add_recipe(all_hybrid_recipe) %>%
+  add_model(svm_linear(mode="classification",
+                         engine="kernlab",
+                         cost=tune(),
+                         margin=tune()))
+
+svm_all_linear_wf <- workflow() %>%
+    add_recipe(all_recipe) %>%
+    add_model(svm_linear(mode="classification",
+                         engine="kernlab",
+                         cost=tune(),
+                         margin=tune()))
+
+
+parameters <- extract_parameter_set_dials(svm_all_linear_hybrid_wf)
+
+tune_svm_all_linear <- tune_bayes(svm_all_linear_hybrid_wf,
+                                  resamples=resamples,
+                                  param_info=parameters, iter=20)
+
+autoplot(tune_svm_all_linear)
+```
+
+```{r}
+show_best(tune_svm_all_linear, metric="roc_auc", n=3)
+```
+
+
+### SVM - polynomial kernel (RGB)
+```{r}
+#| message: FALSE
+#| warning: FALSE
+svm_rgb_poly_hybrid_wf <- workflow() %>%
+  add_recipe(rgb_hybrid_recipe) %>%
+  add_model(svm_poly(mode="classification",
+                       engine="kernlab",
+                       margin=tune(),
+                       degree=tune(),
+                       cost=tune()))
+
+parameters <- extract_parameter_set_dials(svm_rgb_poly_hybrid_wf) %>%
+    update(degree = degree_int(range=c(2, 5)))
+
+tune_svm_rgb_poly <- tune_bayes(svm_rgb_poly_hybrid_wf,
+                                resamples=resamples,
+                                param_info=parameters, iter=25)
+
+autoplot(tune_svm_rgb_poly)
+```
+
+```{r}
+show_best(tune_svm_rgb_poly, metric="roc_auc", n=3)
+```
+```{r}
+# saving the model
+saveRDS(tune_svm_rgb_poly, file = "./tune_svm_rgb_poly.rda")
+```
+
+```{r}
+# tune_svm_rgb_poly = readRDS("./tune_svm_rgb_poly.rda")
+show_best(tune_svm_rgb_poly, metric="roc_auc", n=3)
+```
+
+
+### SVM - polynomial kernel (All Features)
+```{r}
+#| message: FALSE
+#| warning: FALSE
+svm_all_poly_hybrid_wf <- workflow() %>%
+  add_recipe(all_hybrid_recipe) %>%
+  add_model(svm_poly(mode="classification",
+                       engine="kernlab",
+                       margin=tune(),
+                       degree=tune(),
+                       cost=tune()))
+
+svm_all_poly_wf <- workflow() %>%
+  add_recipe(all_recipe) %>%
+  add_model(svm_poly(mode="classification",
+                       engine="kernlab",
+                       margin=tune(),
+                       degree=tune(),
+                       cost=tune()))
+  
+
+parameters <- extract_parameter_set_dials(svm_all_poly_hybrid_wf) %>%
+    update(degree = degree_int(range=c(2, 5)))
+
+tune_svm_all_poly <- tune_bayes(svm_all_poly_hybrid_wf,
+                                resamples=resamples,
+                                param_info=parameters, iter=25)
+
+autoplot(tune_svm_all_poly)
+```
+
+```{r}
+show_best(tune_svm_all_poly, metric="roc_auc", n=3)
+```
+
+
+### SVM - radial basis function kernel (RGB)
+```{r}
+#| message: FALSE
+#| warning: FALSE
+
+svm_rgb_rbf_hybrid_wf <- workflow() %>%
+  add_recipe(rgb_hybrid_recipe) %>%
+  add_model(svm_rbf(mode="classification",
+                      engine="kernlab",
+                      rbf_sigma=tune(),
+                      cost=tune(),
+                      margin=tune()))
+
+parameters <- extract_parameter_set_dials(svm_rgb_rbf_hybrid_wf) %>%
+    update(rbf_sigma = rbf_sigma(range=c(-4, 0), trans=log10_trans()))
+
+tune_svm_rgb_rbf <- tune_bayes(svm_rgb_rbf_hybrid_wf,
+                               resamples=resamples,
+                               param_info=parameters, iter=25)
+
+autoplot(tune_svm_rgb_rbf)
+
+```
+
+```{r}
+show_best(tune_svm_rgb_rbf, metric="roc_auc", n=3)
+```
+
+```{r}
+# saving the model
+saveRDS(tune_svm_rgb_rbf, file = "./tune_svm_rgb_rbf.rda")
+```
+
+```{r}
+# tune_svm_rgb_rbf = readRDS("./tune_svm_rgb_rbf.rda")
+show_best(tune_svm_rgb_rbf, metric="roc_auc", n=3)
+```
+
+
+### SVM - radial basis function kernel (All Features)
+```{r}
+#| message: FALSE
+#| warning: FALSE
+
+svm_all_rbf_hybrid_wf <- workflow() %>%
+  add_recipe(all_hybrid_recipe) %>%
+  add_model(svm_rbf(mode="classification", 
+                      engine="kernlab",
+                      rbf_sigma=tune(),
+                      cost=tune(),
+                      margin=tune()))
+
+svm_all_rbf_wf <- workflow() %>%
+  add_recipe(all_recipe) %>%
+  add_model(svm_rbf(mode="classification", 
+                      engine="kernlab",
+                      rbf_sigma=tune(),
+                      cost=tune(),
+                      margin=tune()))
+  
+
+parameters <- extract_parameter_set_dials(svm_all_rbf_hybrid_wf) %>%
+    update(rbf_sigma = rbf_sigma(range=c(-4, 0), trans=log10_trans()))
+
+tune_svm_all_rbf <- tune_bayes(svm_all_rbf_hybrid_wf,
+                               resamples=resamples,
+                               param_info=parameters, iter=25)
+
+autoplot(tune_svm_all_rbf)
+```
+
+```{r}
+show_best(tune_svm_all_rbf, metric="roc_auc", n=3)
+```
+
+
+
+## Evaluate and Compare Performance of SVM Models with CV
+### RGB space
+```{r}
+#| message: FALSE
+#| warning: FALSE
+# Fit three best tuned models with cross-validation without DS&SMOTE
+
+svm_rgb_linear_wf <- workflow() %>%
+  add_recipe(rgb_recipe) %>%
+  add_model(svm_linear(mode="classification",
+                         engine="kernlab",
+                         cost=tune(),
+                         margin=tune()))
+
+svm_rgb_poly_wf <- workflow() %>%
+  add_recipe(rgb_recipe) %>%
+  add_model(svm_poly(mode="classification",
+                       engine="kernlab",
+                       margin=tune(),
+                       degree=tune(),
+                       cost=tune()))
+
+svm_rgb_rbf_wf <- workflow() %>%
+  add_recipe(rgb_recipe) %>%
+  add_model(svm_rbf(mode="classification",
+                      engine="kernlab",
+                      rbf_sigma=tune(),
+                      cost=tune(),
+                      margin=tune()))
+
+best_svm_rgb_linear_cv <- svm_rgb_linear_wf %>%
+  finalize_workflow(select_best(tune_svm_rgb_linear, metric="roc_auc")) %>%
+  fit_resamples(resamples=resamples, metrics=cv_metrics, control=cv_control)
+
+best_svm_rgb_poly_cv <- svm_rgb_poly_wf %>%
+  finalize_workflow(select_best(tune_svm_rgb_poly, metric="roc_auc")) %>%
+  fit_resamples(resamples=resamples, metrics=cv_metrics, control=cv_control)
+
+best_svm_rgb_rbf_cv <- svm_rgb_rbf_wf %>%
+  finalize_workflow(select_best(tune_svm_rgb_rbf, metric="roc_auc")) %>%
+  fit_resamples(resamples=resamples, metrics=cv_metrics, control=cv_control)
+
+saveRDS(best_svm_rgb_linear_cv, file = "./best_svm_rgb_linear_cv.rda")  # save the cv models
+saveRDS(best_svm_rgb_poly_cv, file = "./best_svm_rgb_poly_cv.rda")
+saveRDS(best_svm_rgb_rbf_cv, file = "./best_svm_rgb_rbf_cv.rda")
+
+```
+
+```{r}
+# best_svm_rgb_linear_cv = readRDS("./best_svm_rgb_linear_cv.rda")
+# best_svm_rgb_poly_cv = readRDS("./best_svm_rgb_poly_cv.rda")
+# best_svm_rgb_rbf_cv = readRDS("./best_svm_rgb_rbf_cv.rda")
+
+```
+
+
+```{r}
+# Overlaying ROC curves for the three tuned SMV models with CV
+roc_cv_data <- function(model_cv) {
+  cv_predictions <- collect_predictions(model_cv)
+  cv_predictions %>%
+    roc_curve(truth = BT, .pred_TRUE, event_level = "first")
+  }
+
+svm_rgb_roc_cv <- bind_rows(
+  roc_cv_data(best_svm_rgb_linear_cv) %>% 
+    mutate(Tuned_model="SVM with linear kernel", Color_space="RGB"),
+  roc_cv_data(best_svm_rgb_poly_cv) %>% 
+    mutate(Tuned_model="SVM with polynomial kernel", Color_space="RGB"),
+  roc_cv_data(best_svm_rgb_rbf_cv) %>% 
+    mutate(Tuned_model="SVM with radial basis function kernel", Color_space="RGB")
+  ) 
+
+g <- svm_rgb_roc_cv %>%
+  ggplot(aes(x=1 - specificity, y=sensitivity, color=Tuned_model)) +
+  geom_line() +
+  theme(aspect.ratio=1)
+g
+```
+
+```{r}
+g_zoom <- g +
+coord_cartesian(xlim=c(0, 0.2), ylim=c(0.8, 1)) +
+guides(colour="none")
+
+g_zoom
+```
+
+```{r}
+# Compare performance metrics
+
+bind_rows(
+  collect_metrics(best_svm_rgb_linear_cv) %>% mutate(model="SVM with linear kernel"),
+  collect_metrics(best_svm_rgb_poly_cv) %>% mutate(model="SVM with polynomial kernel"),
+  collect_metrics(best_svm_rgb_rbf_cv) %>% mutate(model="SVM with radial basis function kernel")
+  ) %>%
+  select(model, .metric, mean) %>%
+  pivot_wider(names_from = .metric, values_from = mean) %>%
+  knitr::kable(caption="Cross-validation performance metrics", digits=3)
+```
+
+
+### All feature space
+```{r}
+#| message: FALSE
+#| warning: FALSE
+# Fit three best tuned models with cross-validation without DS&SMOTE
+
+best_svm_all_linear_cv <- svm_all_linear_wf %>%
+  finalize_workflow(select_best(tune_svm_all_linear, metric="roc_auc")) %>%
+  fit_resamples(resamples=resamples, metrics=cv_metrics, control=cv_control)
+
+best_svm_all_poly_cv <- svm_all_poly_wf %>%
+  finalize_workflow(select_best(tune_svm_all_poly, metric="roc_auc")) %>%
+  fit_resamples(resamples=resamples, metrics=cv_metrics, control=cv_control)
+
+best_svm_all_rbf_cv <- svm_all_rbf_wf %>%
+  finalize_workflow(select_best(tune_svm_all_rbf, metric="roc_auc")) %>%
+  fit_resamples(resamples=resamples, metrics=cv_metrics, control=cv_control)
+
+saveRDS(best_svm_all_linear_cv, file = "./best_svm_all_linear_cv.rda")  # save the cv models
+saveRDS(best_svm_all_poly_cv, file = "./best_svm_all_poly_cv.rda")
+saveRDS(best_svm_all_rbf_cv, file = "./best_svm_all_rbf_cv.rda")
+
+```
+
+```{r}
+# best_svm_all_linear_cv = readRDS("./best_svm_all_linear_cv.rda")
+# best_svm_all_poly_cv = readRDS("./best_svm_all_poly_cv.rda")
+# best_svm_all_rbf_cv = readRDS("./best_svm_all_rbf_cv.rda")
+
+```
+
+```{r}
+# Overlaying ROC curves for the three tuned SMV models with CV
+
+svm_roc_cv <- bind_rows(
+  roc_cv_data(best_svm_all_linear_cv) %>% 
+    mutate(Tuned_model="SVM with linear kernel", Color_space="All Predictors"),
+  roc_cv_data(best_svm_all_poly_cv) %>% 
+    mutate(Tuned_model="SVM with polynomial kernel", Color_space="All Predictors"),
+  roc_cv_data(best_svm_all_rbf_cv) %>% 
+    mutate(Tuned_model="SVM with radial basis function kernel", Color_space="All Predictors"),
+  svm_rgb_roc_cv
+  )
+
+g_all <- svm_roc_cv %>%
+  ggplot(aes(x=1 - specificity, y=sensitivity, color=Tuned_model)) +
+  geom_line(aes(linetype = Color_space)) +
+  theme(aspect.ratio=1)
+
+g_all
+```
+
+```{r}
+g_all_zoom <- g_all +
+coord_cartesian(xlim=c(0, 0.2), ylim=c(0.8, 1)) +
+guides(colour="none")
+
+g_all_zoom
+```
+
+```{r}
+# Compare CV performance metrics (All feature space)
+
+bind_rows(
+  collect_metrics(best_svm_all_linear_cv) %>% mutate(model="SVM with linear kernel"),
+  collect_metrics(best_svm_all_poly_cv) %>% mutate(model="SVM with polynomial kernel"),
+  collect_metrics(best_svm_all_rbf_cv) %>% mutate(model="SVM with radial basis function kernel")
+  ) %>%
+  select(model, .metric, mean) %>%
+  pivot_wider(names_from = .metric, values_from = mean) %>%
+  knitr::kable(caption="Cross-validation performance metrics for SVM models with all feature space", digits=3)
+```
+
+
+### Threshold Selection with CV for the three tuned SMV models (RGB)
+```{r}
+# Threshold Selection with CV for the three tuned SMV models
+overview_model(best_svm_rgb_linear_cv, "SVM with linear kernel")
+overview_model(best_svm_rgb_poly_cv, "SVM with polynomial kernel")
+overview_model(best_svm_rgb_rbf_cv, "SVM with radial basis function kernel")
+
+```
+
+
+### Threshold Selection with CV for the three tuned SMV models (All features)
+```{r}
+overview_model(best_svm_all_linear_cv, "SVM with linear kernel")
+overview_model(best_svm_all_poly_cv, "SVM with polynomial kernel")
+overview_model(best_svm_all_rbf_cv, "SVM with radial basis function kernel")
+```
+
+
+### Finalize the SVM Models with Full Training Set and Threshold Selection for the Holdout Set (RGB)
+```{r}
+# Finalize all three SVM models
+final_svm_rgb_linear <- svm_rgb_linear_wf %>%
+  finalize_workflow(select_best(tune_svm_rgb_linear, metric="roc_auc")) %>%
+  fit(data = train_data)
+
+final_svm_rgb_poly <- svm_rgb_poly_wf %>%
+  finalize_workflow(select_best(tune_svm_rgb_poly, metric="roc_auc")) %>%
+  fit(data = train_data)
+
+final_svm_rgb_rbf <- svm_rgb_rbf_wf %>%
+  finalize_workflow(select_best(tune_svm_rgb_rbf, metric="roc_auc")) %>%
+  fit(data = train_data)
+
+saveRDS(final_svm_rgb_linear, file = "./final_svm_rgb_linear.rda")  # save the cv models
+saveRDS(final_svm_rgb_poly, file = "./final_svm_rgb_poly.rda")
+saveRDS(final_svm_rgb_rbf, file = "./final_svm_rgb_rbf.rda")
+
+```
+
+```{r}
+# final_svm_rgb_linear = readRDS("./final_svm_rgb_linear.rda")
+# final_svm_rgb_poly = readRDS("./final_svm_rgb_poly.rda")
+# final_svm_rgb_rbf = readRDS("./final_svm_rgb_rbf.rda")
+
+```
+
+```{r}
+# Threshold Selection for Holdout Set
+final_svm_rgb_linear_threshold_holdout <- threshold_graph_final_model(final_svm_rgb_linear,
+                                                    holdout_data,
+                                                    "SVM with linear kernel")
+
+final_svm_rgb_poly_threshold_holdout <- threshold_graph_final_model(final_svm_rgb_poly,
+                                                    holdout_data,
+                                                    "SVM with polynomial kernel")
+
+final_svm_rgb_rbf_threshold_holdout <- threshold_graph_final_model(final_svm_rgb_rbf,
+                                                    holdout_data,
+                                                    "SVM with radial basis function kernel")
+
+final_svm_rgb_linear_threshold_holdout$graph
+final_svm_rgb_poly_threshold_holdout$graph
+final_svm_rgb_rbf_threshold_holdout$graph
+```
+
+```{r}
+final_svm_rgb_linear_threshold_holdout$opt_thresholds['f_meas']
+```
+```{r}
+final_svm_rgb_poly_threshold_holdout$opt_thresholds['f_meas']
+```
+```{r}
+final_svm_rgb_rbf_threshold_holdout$opt_thresholds['f_meas']
+```
+
+
+### Finalize the SVM Models with Full Training Set and Threshold Selection for the Holdout Set (All features)
+```{r}
+# Finalize all three SVM models in all feature space
+final_svm_all_linear <- svm_all_linear_wf %>%
+  finalize_workflow(select_best(tune_svm_all_linear, metric="roc_auc")) %>%
+  fit(data = train_data)
+
+final_svm_all_poly <- svm_all_poly_wf %>%
+  finalize_workflow(select_best(tune_svm_all_poly, metric="roc_auc")) %>%
+  fit(data = train_data)
+
+final_svm_all_rbf <- svm_all_rbf_wf %>%
+  finalize_workflow(select_best(tune_svm_all_rbf, metric="roc_auc")) %>%
+  fit(data = train_data)
+
+saveRDS(final_svm_all_linear, file = "./final_svm_all_linear.rda")  # save the cv models
+saveRDS(final_svm_all_poly, file = "./final_svm_all_poly.rda")
+saveRDS(final_svm_all_rbf, file = "./final_svm_all_rbf.rda")
+```
+
+```{r}
+# final_svm_all_linear = readRDS("./final_svm_all_linear.rda")
+# final_svm_all_poly = readRDS("./final_svm_all_poly.rda")
+# final_svm_all_rbf = readRDS("./final_svm_all_rbf.rda")
+
+```
+
+```{r}
+# Threshold Selection for Holdout Set
+
+final_svm_all_linear_threshold_holdout <- threshold_graph_final_model(final_svm_all_linear,
+                                                    holdout_data,
+                                                    "SVM with linear kernel")
+
+final_svm_all_poly_threshold_holdout <- threshold_graph_final_model(final_svm_all_poly,
+                                                    holdout_data,
+                                                    "SVM with polynomial kernel")
+
+final_svm_all_rbf_threshold_holdout <- threshold_graph_final_model(final_svm_all_rbf,
+                                                    holdout_data,
+                                                    "SVM with radial basis function kernel")
+
+final_svm_all_linear_threshold_holdout$graph
+final_svm_all_poly_threshold_holdout$graph
+final_svm_all_rbf_threshold_holdout$graph
+```
+
+```{r}
+final_svm_all_linear_threshold_holdout$opt_thresholds['f_meas']
+```
+```{r}
+final_svm_all_poly_threshold_holdout$opt_thresholds['f_meas']
+```
+```{r}
+final_svm_all_rbf_threshold_holdout$opt_thresholds['f_meas']
+```
+
+
+### Overlay ROC curves for three SVM models between two RGB and All-feature with training and holdout data
+```{r}
+# For SVM with linear kernel
+
+# Tuned model CV predictions
+cv_rgb_preds <- collect_predictions(best_svm_rgb_linear_cv) %>%
+  roc_curve(truth = BT, .pred_TRUE, event_level = "first") %>%
+  mutate(Source = "training_CV", Color_space = "RGB")
+
+cv_all_preds <- collect_predictions(best_svm_all_linear_cv) %>%
+  roc_curve(truth = BT, .pred_TRUE, event_level = "first") %>%
+  mutate(Source = "training_CV", Color_space = "All Predictors")
+
+# Final model prediction
+holdout_rgb_preds <- augment(final_svm_rgb_linear, new_data = holdout_data) %>%
+  roc_curve(truth = BT, .pred_TRUE, event_level = "first") %>%
+  mutate(Source = "holdout", Color_space = "RGB")
+
+holdout_all_preds <- augment(final_svm_all_linear, new_data = holdout_data) %>%
+  roc_curve(truth = BT, .pred_TRUE, event_level = "first") %>%
+  mutate(Source = "holdout", Color_space = "All Predictors")
+
+# Compute ROC
+svm_linear_roc_data <- bind_rows(cv_rgb_preds, cv_all_preds, holdout_rgb_preds, holdout_all_preds)
+
+saveRDS(svm_linear_roc_data, file = "./svm_linear_roc_data.rda")
+```
+
+```{r}
+#svm_linear_roc_data = readRDS("./svm_linear_roc_data.rda")
+g_svm_linear <- svm_linear_roc_data %>%
+  ggplot(aes(x=1 - specificity, y=sensitivity, color=Color_space)) +
+    geom_line(aes(linetype = Source)) +
+    theme(aspect.ratio=1)
+
+g_svm_linear
+```
+```{r}
+g_svm_linear_zoom <- g_svm_linear +
+coord_cartesian(xlim=c(0, 0.2), ylim=c(0.8, 1)) +
+guides(colour="none")
+
+g_svm_linear_zoom
+```
+
+```{r}
+# For SVM with polynormial kernel
+
+# Tuned model CV predictions
+cv_rgb_preds <- collect_predictions(best_svm_rgb_poly_cv) %>%
+  roc_curve(truth = BT, .pred_TRUE, event_level = "first") %>%
+  mutate(Source = "training_CV", Color_space = "RGB")
+cv_all_preds <- collect_predictions(best_svm_all_poly_cv) %>%
+  roc_curve(truth = BT, .pred_TRUE, event_level = "first") %>%
+  mutate(Source = "training_CV", Color_space = "All Predictors")
+
+# Final model prediction
+holdout_rgb_preds <- augment(final_svm_rgb_poly, new_data = holdout_data) %>%
+  roc_curve(truth = BT, .pred_TRUE, event_level = "first") %>%
+  mutate(Source = "holdout", Color_space = "RGB")
+holdout_all_preds <- augment(final_svm_all_poly, new_data = holdout_data) %>%
+  roc_curve(truth = BT, .pred_TRUE, event_level = "first") %>%
+  mutate(Source = "holdout", Color_space = "All Predictors")
+
+# Compute ROC
+svm_poly_roc_data <- bind_rows(cv_rgb_preds, cv_all_preds, holdout_rgb_preds, holdout_all_preds)
+
+saveRDS(svm_poly_roc_data, file = "./svm_poly_roc_data.rda")
+```
+
+```{r}
+# svm_poly_roc_data = readRDS("./svm_poly_roc_data.rda")
+g_svm_poly <- svm_poly_roc_data %>%
+  ggplot(aes(x=1 - specificity, y=sensitivity, color=Color_space)) +
+  geom_line(aes(linetype = Source)) +
+  theme(aspect.ratio=1)
+
+g_svm_poly
+```
+
+```{r}
+g_svm_poly_zoom <- g_svm_poly +
+coord_cartesian(xlim=c(0, 0.2), ylim=c(0.5, 1)) +
+guides(colour="none")
+
+g_svm_poly_zoom
+```
+
+```{r}
+# For SVM with radial basis function kernel
+
+# Tuned model CV predictions
+cv_rgb_preds <- collect_predictions(best_svm_rgb_rbf_cv) %>%
+  roc_curve(truth = BT, .pred_TRUE, event_level = "first") %>%
+  mutate(Source = "training_CV", Color_space = "RGB")
+cv_all_preds <- collect_predictions(best_svm_all_rbf_cv) %>%
+  roc_curve(truth = BT, .pred_TRUE, event_level = "first") %>%
+  mutate(Source = "training_CV", Color_space = "All Predictors")
+
+# Final model prediction
+holdout_rgb_preds <- augment(final_svm_rgb_rbf, new_data = holdout_data) %>%
+  roc_curve(truth = BT, .pred_TRUE, event_level = "first") %>%
+  mutate(Source = "holdout", Color_space = "RGB")
+holdout_all_preds <- augment(final_svm_all_rbf, new_data = holdout_data) %>%
+  roc_curve(truth = BT, .pred_TRUE, event_level = "first") %>%
+  mutate(Source = "holdout", Color_space = "All Predictors")
+
+# Compute ROC
+svm_rbf_roc_data <- bind_rows(cv_rgb_preds, cv_all_preds, holdout_rgb_preds, holdout_all_preds)
+
+saveRDS(svm_rbf_roc_data, file = "./svm_rbf_roc_data.rda")
+```
+
+```{r}
+# svm_rbf_roc_data = readRDS("./svm_rbf_roc_data.rda")
+g_svm_rbf <- svm_rbf_roc_data %>%
+  ggplot(aes(x=1 - specificity, y=sensitivity, color=Color_space)) +
+  geom_line(aes(linetype = Source)) +
+  theme(aspect.ratio=1)
+
+g_svm_rbf
+```
+
+```{r}
+g_svm_rbf_zoom <- g_svm_rbf +
+coord_cartesian(xlim=c(0, 0.2), ylim=c(0.8, 1)) +
+guides(colour="none")
+
+g_svm_rbf_zoom
+```
+
+
+### Calculate Performance Metrics at the Optimal Threshold for All SVM Models (RGB)
+```{r}
+metrics_svm_rgb_linear <- calculate_metrics_at_threshold(
+    final_svm_rgb_linear, train_data, holdout_data,
+    "SVM with linear kernel", "RGB",
+    0.23, 0.99) %>% select(-.estimator)
+
+metrics_svm_rgb_poly <- calculate_metrics_at_threshold(
+    final_svm_rgb_poly, train_data, holdout_data,
+    "SVM with polynomial kernel", "RGB",
+    0.25, 0.99) %>% select(-.estimator)
+
+metrics_svm_rgb_rbf <- calculate_metrics_at_threshold(
+    final_svm_rgb_rbf, train_data, holdout_data,
+    "SVM with radial basis function kernel", "RGB",
+    0.31, 0.99) %>% select(-.estimator)
+
+```
+```{r}
+all_svm_metrics <- bind_rows(metrics_svm_rgb_linear,
+          metrics_svm_rgb_poly,
+          metrics_svm_rgb_rbf)
+
+saveRDS(all_svm_metrics, file = "./all_svm_metrics.rda")
+
+```
+
+```{r}
+# all_svm_rgb_metrics = readRDS("./all_svm_metrics.rda")
+```
+
+```{r}
+all_svm_rgb_metrics %>%
+  pivot_wider(names_from = .metric, values_from = .estimate) %>%
+  knitr::kable(caption="Performance Metrics for Tuned SVM Models at Optimal Threshold in RGB Space", digits=3)
+```
+
+
+### Calculate Performance Metrics at the Optimal Threshold for All SVM Models (All features)
+```{r}
+metrics_svm_all_linear <- calculate_metrics_at_threshold(
+    final_svm_all_linear, train_data, holdout_data,
+    "SVM with linear kernel", "All Predictors",
+    0.41, 0.99) %>% select(-.estimator)
+
+metrics_svm_all_poly <- calculate_metrics_at_threshold(
+    final_svm_all_poly, train_data, holdout_data,
+    "SVM with polynomial kernel", "All Predictors",
+    0.31, 0.99) %>% select(-.estimator)
+
+metrics_svm_all_rbf <- calculate_metrics_at_threshold(
+    final_svm_all_rbf, train_data, holdout_data,
+    "SVM with radial basis function kernel", "All Predictors",
+    0.55, 0.99) %>% select(-.estimator)
+
+```
+```{r}
+all_svm_all_metrics <- bind_rows(metrics_svm_all_linear,
+          metrics_svm_all_poly,
+          metrics_svm_all_rbf)
+
+saveRDS(all_svm_all_metrics, file = "./all_svm_all_metrics.rda")
+
+```
+
+```{r}
+# all_svm_all_metrics = readRDS("./all_svm_all_metrics.rda")
+```
+
+```{r}
+all_svm_all_metrics %>% bind_rows(all_svm_rgb_metrics) %>% 
+  pivot_wider(names_from = .metric, values_from = .estimate) %>%
+  arrange(dataset) |> 
+  select(model, everything()) |>
+  knitr::kable(caption="Performance Metrics for Tuned SVM Models at Optimal Threshold", digits=3) |> 
+  kable_styling(full_width = F) |> 
+  #kable_styling(position = "center") |> 
+  collapse_rows(columns=3)
+```
+
+```{r}
+# Stop cluster
+stopCluster(cl)
+registerDoSEQ()
+```
+
+

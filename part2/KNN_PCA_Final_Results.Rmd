@@ -1,0 +1,81 @@
+---
+title: "KNN values"
+author: "Virginia Brame"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r}
+library(tidyverse)
+library(kableExtra)
+```
+
+### FOR HAI
+```{r}
+knn_results_pca_hybrid_rgb <- data.frame(
+  color_space = c("RGB+PCA", "RGB+PCA"),
+  model = c("k-nearest neighbor", "k-nearest neighbor"),
+  dataset = c("train", "holdout"),
+  threshold = c(0.87, 0.87),
+  accuracy = c(0.99688, 0.99272),
+  kap = c(0.95026, 0.64704),
+  f_meas = c(0.95187, 0.65037),
+  roc_auc = c(0.99972, 0.99735)
+)
+
+knn_results_pca_hybrid_ev <- data.frame(
+  color_space = c("All predictors+PCA", "All predictors+PCA"),
+  model = c("k-nearest neighbor", "k-nearest neighbor"),
+  dataset = c("train", "holdout"),
+  threshold = c(0.56, 0.56),
+  accuracy = c(0.99989, 0.98403),
+  kap = c(0.99821, 0.46565),
+  f_meas = c(0.99827, 0.47152),
+  roc_auc = c(1.00000, 0.99415)
+)
+```
+
+```{r}
+knn_results_pca_hybrid_rgb
+```
+```{r}
+knn_results_pca_hybrid_ev
+```
+
+```{r}
+virginia_knn <- bind_rows(knn_results_pca_hybrid_rgb, knn_results_pca_hybrid_ev)
+
+hai_knn <- data.frame(
+  color_space = c("RGB", "RGB"),
+  model = c("k-nearest neighbor", "k-nearest neighbor"),
+  dataset = c("train", "holdout"),
+  threshold = c(0.49, 0.64),
+  accuracy = c(0.997, 0.995),
+  kap = c(0.952, 0.682),
+  f_meas = c(0.954, 0.685),
+  roc_auc = c(1.000, 0.968)
+)
+
+```
+
+```{r}
+bind_rows(hai_knn, virginia_knn) |> 
+  arrange(dataset) |> 
+  select(model, everything()) |> 
+  kable(caption="Performance Metrics at Optimal Threshold for Tuned KNN Models", digits = 3) |> 
+  kable_styling(full_width = F) |> 
+  kable_styling(position = "center") |> 
+  collapse_rows(columns=3)
+
+```
+
+
+
+
+
+
+
+
+
+
+
