@@ -1,0 +1,2144 @@
+---
+title: "Project Part 1"
+author: "Virginia Brame, Clay Harris, Hai Liu"
+date: "`r Sys.Date()`"
+output:
+  pdf_document: default
+  word_document: default
+header-includes: \usepackage{float}
+---
+```{r setup}
+knitr::opts_chunk$set(
+  echo = FALSE,
+  cache = TRUE,
+  autodep = TRUE,
+  fig.align = "center",
+  fig.pos = "H",
+  out.width = "100%"
+)
+```
+
+```{r echo true, eval=FALSE}
+# Set eval to TRUE if you want to see the R code outputs
+knitr::opts_chunk$set(
+  echo = TRUE)
+```
+
+## Data (loading, wrangling, EDA)
+
+```{r parallel}
+#| cache: FALSE
+#| message: FALSE
+library(doParallel)
+cl <- makePSOCKcluster(parallel::detectCores(logical = FALSE))
+registerDoParallel(cl)
+```
+
+```{r libraries}
+#| cache: FALSE
+#| warning: FALSE
+#| message: FALSE
+library(tidyverse)
+library(tidymodels)
+library(discrim)
+library(leaflet)
+library(terra)
+library(htmlwidgets)
+library(leafem)
+library(colordistance)
+library(jpeg)
+library(patchwork)
+library(probably)
+library(gridExtra)
+library(plotly)
+library(mapview)
+library(farver)
+library(kableExtra)
+library(leaflet.extras2)
+library(webshot2)
+```
+
+### Data loading and wrangling
+
+Since we are only interested in the level of "Blue Tarp", I create a new variable `BT` with only two classes, i.e., "TRUE" for "Blue Tarp" and "FALSE" for everything else.
+
+```{r holdout data processing}
+#| message: FALSE
+#| warning: FALSE
+
+col_names <- c('ID','X','Y','Map X','Map Y','Lat','Lon','Red','Green','Blue')
+
+blue_files <- c(
+  "orthovnir069_ROI_Blue_Tarps.txt",
+  "orthovnir067_ROI_Blue_Tarps.txt",
+  "orthovnir078_ROI_Blue_Tarps.txt"
+)
+
+non_blue_files <- c(
+  "orthovnir057_ROI_NON_Blue_Tarps.txt",
+  "orthovnir078_ROI_NON_Blue_Tarps.txt",
+  "orthovnir067_ROI_NOT_Blue_Tarps.txt",
+  "orthovnir069_ROI_NOT_Blue_Tarps.txt"
+)
+
+blue_data <- map_dfr(blue_files, ~ 
+  read_table(.x, comment = ";", col_names = col_names, col_types = cols(
+    `Map X` = col_double(),
+    `Map Y` = col_double(),
+    Red = col_integer(),
+    Green = col_integer(),
+    Blue = col_integer()
+  )) %>% 
+    select(`Map X`, `Map Y`, Red, Green, Blue) %>% 
+    mutate(BT = "TRUE")
+)
+
+non_blue_data <- map_dfr(non_blue_files, ~ 
+  read_table(.x, comment = ";", col_names = col_names, col_types = cols(
+    `Map X` = col_double(),
+    `Map Y` = col_double(),
+    Red = col_integer(),
+    Green = col_integer(),
+    Blue = col_integer()
+  )) %>% 
+    select(`Map X`, `Map Y`, Red, Green, Blue) %>% 
+    mutate(BT = "FALSE")
+)
+
+holdout_data <- bind_rows(blue_data, non_blue_data) %>% 
+  mutate(BT = factor(BT, levels = c("TRUE", "FALSE")))
+```
+
+```{r training data processing}
+#| message: FALSE
+
+train_data <- read_csv("HaitiPixels.csv") %>%
+  mutate(BT = factor(if_else(Class == "Blue Tarp", "TRUE", "FALSE"), levels = c("TRUE", "FALSE"))) %>%
+  select(Red, Green, Blue, BT)
+```
+
+```{r add CIELab and HSV}
+convert_color_spaces <- function(data) {
+  # Convert RGB to CIELab
+  lab_values <- farver::convert_colour(
+    as.matrix(data[, c("Red", "Green", "Blue")]), 
+    from = "rgb", 
+    to = "lab"
+  )
+  
+  # Convert RGB to HSV
+  hsv_values <- farver::convert_colour(
+    as.matrix(data[, c("Red", "Green", "Blue")]), 
+    from = "rgb", 
+    to = "hsv"
+  )
+  
+  # Convert
+  lab_df <- as.data.frame(lab_values)
+  colnames(lab_df) <- c("Luminance", "a", "b") 
+  hsv_df <- as.data.frame(hsv_values)
+  colnames(hsv_df) <- c("Hue", "Saturation", "Value")
+  
+  # Bind new columns
+  data <- cbind(data, lab_df, hsv_df)
+  
+  return(data)
+}
+
+# Apply function
+train_data <- convert_color_spaces(train_data)
+holdout_data <- convert_color_spaces(holdout_data)
+```
+
+### EDA
+
+```{r prepare spatial data}
+# Map X and Map Y
+holdout_data_sp <- holdout_data %>%
+  rename(x = `Map X`, y = `Map Y`)
+
+# Convert to spatial vector
+v_utm <- terra::vect(holdout_data_sp, geom = c("x", "y"), crs = "EPSG:32618")
+
+# Create an empty raster
+r_empty <- terra::rast(terra::ext(v_utm), resolution = 0.4, crs = "EPSG:32618")
+
+# Rasterize
+r_b1 <- terra::rasterize(v_utm, r_empty, field = "Red", overwrite = TRUE)
+r_b2 <- terra::rasterize(v_utm, r_empty, field = "Green", overwrite = TRUE)
+r_b3 <- terra::rasterize(v_utm, r_empty, field = "Blue", overwrite = TRUE)
+
+# Combine
+rgb_raster <- c(r_b1, r_b2, r_b3)
+
+# Reproject to WGS84
+rgb_raster_wgs <- terra::project(rgb_raster, "EPSG:4326", overwrite = TRUE)
+
+# Convert to brick
+rgb_brick <- raster::brick(rgb_raster_wgs)
+```
+
+```{r prepare spatial data fine}
+# Map X and Map Y
+holdout_data_sp <- holdout_data %>%
+  rename(x = `Map X`, y = `Map Y`)
+
+# Convert to spatial vector
+v_utm <- terra::vect(holdout_data_sp, geom = c("x", "y"), crs = "EPSG:32618")
+
+# Create an empty raster
+r_empty <- terra::rast(terra::ext(v_utm), resolution = 0.08, crs = "EPSG:32618")
+
+# Rasterize
+r_b1 <- terra::rasterize(v_utm, r_empty, field = "Red", overwrite = TRUE)
+r_b2 <- terra::rasterize(v_utm, r_empty, field = "Green", overwrite = TRUE)
+r_b3 <- terra::rasterize(v_utm, r_empty, field = "Blue", overwrite = TRUE)
+
+# Combine
+rgb_raster <- c(r_b1, r_b2, r_b3)
+
+# Reproject to WGS84
+rgb_raster_wgs <- terra::project(rgb_raster, "EPSG:4326", overwrite = TRUE)
+
+# Convert to brick
+rgb_brick <- raster::brick(rgb_raster_wgs)
+```
+
+```{r create map}
+# Create the map
+m <- leaflet(options = leafletOptions(maxZoom = 25)) %>%
+  addTiles(options = tileOptions(maxZoom = 25)) %>%
+  leafem::addRasterRGB(rgb_brick, r = 1, g = 2, b = 3) %>%
+  
+  # Add scale bar
+  addScaleBar(position = "bottomleft", options = scaleBarOptions(metric = TRUE, imperial = FALSE)) %>%
+
+  # Add easyPrint button
+  addEasyprint(options = easyprintOptions(
+    title = "Print Map",
+    position = "topright",
+    exportOnly = TRUE  # Change to FALSE for direct printing
+  ))
+
+# Save the interactive map
+htmlwidgets::saveWidget(m, "interactive_map.html")
+
+#if (knitr::is_html_output()) {
+#  htmltools::includeHTML("interactive_map.html")
+#} else {
+  # Save a static image for PDF output
+#  mapshot(m, file = "map_static.png")
+#  knitr::include_graphics("map_static.png")
+#}
+```
+
+```{r calculate area}
+# Identify non-null pixels
+non_na_mask <- !is.na(r_b1) | !is.na(r_b2) | !is.na(r_b3)
+
+# Count cells
+non_na_cells <- sum(terra::values(non_na_mask), na.rm = TRUE)
+
+# Area of one pixel
+cell_area_km2 <- (terra::res(r_empty)[1] * terra::res(r_empty)[2]) / 1e6
+
+# Total area
+total_area_km2 <- non_na_cells * cell_area_km2
+
+# Print the result
+total_area_km2
+```
+
+```{r density plots}
+rgb1 <- train_data %>% 
+  ggplot(aes(x=Red,fill=BT))+ 
+  geom_density(alpha=0.4)+ 
+  scale_fill_manual(values=c("cyan", "tomato"))
+
+rgb2 <- train_data %>% 
+  ggplot(aes(x=Green,fill=BT))+ 
+  geom_density(alpha=0.4)+ 
+  scale_fill_manual(values=c("cyan", "tomato"))
+
+rgb3 <- train_data %>% 
+  ggplot(aes(x=Blue,fill=BT))+ 
+  geom_density(alpha=0.4)+ 
+  scale_fill_manual(values=c("cyan", "tomato"))
+
+grid.arrange(rgb1, rgb2, rgb3, top = "BT assignment by color layer | Training")
+```
+
+```{r density plots 2}
+rgb4 <- holdout_data %>% 
+  ggplot(aes(x=Red,fill=BT))+ 
+  geom_density(alpha=0.4)+ 
+  scale_fill_manual(values=c("cyan", "tomato"))
+
+rgb5 <- holdout_data %>% 
+  ggplot(aes(x=Green,fill=BT))+ 
+  geom_density(alpha=0.4)+ 
+  scale_fill_manual(values=c("cyan", "tomato"))
+
+rgb6 <- holdout_data %>% 
+  ggplot(aes(x=Blue,fill=BT))+ 
+  geom_density(alpha=0.4)+ 
+  scale_fill_manual(values=c("cyan", "tomato"))
+
+grid.arrange(rgb4, rgb5, rgb6, top = "BT assignment by color layer | Holdout")
+```
+
+Understanding that:
+-   Blue is 0,0,255
+-   Green is 0,255,0
+-   Red is 255,0,0
+
+```{r}
+# code for Figure 5
+
+# correlations between color layers
+RGB_only_train <- train_DRH %>% 
+  dplyr::select(Red, Green, Blue)
+
+T <- cor(RGB_only_train, )
+corrplot(T, method='number', type='lower', col = COL2('RdBu', 5))
+
+RGB_only_holdout <- holdout_DRH %>% 
+  dplyr::select(Red, Green, Blue)
+
+H = cor(RGB_only_holdout)
+corrplot(H, method='number', type='lower', col = COL2('RdBu', 100))
+
+```
+
+
+```{r}
+# code for figure 6
+# training
+b1 <- ggplot(train_data, aes(x=Red, y=Blue, color=BT))+
+  geom_point(size=1, alpha=0.25)+
+  labs(title="Red vs Blue with Training Data")
+
+b2 <- ggplot(holdout_data, aes(x=Red, y=Blue, color=BT))+
+  geom_point(size=0.1, alpha=0.25)+
+  labs(title="Red vs Blue with Holdout Data", caption = "Figure 1.2: Scatterplots of red and blue layers as they relate to the detection of blue tarp")
+
+grid.arrange(b1, b2, nrow=2, ncol=1)
+
+# holdout
+b1 <- ggplot(train_data, aes(x=Red, y=Blue, color=BT))+
+  geom_point(size=1, alpha=0.25)+
+  labs(title="Red vs Blue with Training Data")
+
+b2 <- ggplot(holdout_data aes(x=Red, y=Blue, color=BT))+
+  geom_point(size=0.1, alpha=0.25)+
+  labs(title="Red vs Blue with Holdout Data", caption = "Figure 1.2: Scatterplots of red and blue layers as they relate to the detection of blue tarp")
+
+grid.arrange(b1, b2, nrow=2, ncol=1)
+```
+
+```{r plotly plot}
+if (knitr::is_html_output()) {
+  plot_ly(train_data, x = ~Red, y = ~Green, z = ~Blue, color = ~BT, 
+          colors = c("tomato", "cyan")) %>%
+    add_markers() %>%
+    layout(title = "Test Data | 3D RGB Plot by BlueTarp",
+           scene = list(xaxis = list(title = 'Red'),
+                        yaxis = list(title = 'Green'),
+                        zaxis = list(title = 'Blue')))
+} else {
+  message("No plotly plot.")
+}
+```
+Here we can clearly see the separation of the two levels of BlueTarp in the training data.  
+
+```{r makeshift village}
+#| message: FALSE
+image_path <- "orthovnir078_makeshift_villiage1.jpg"
+colordistance::plotPixels(image_path)
+
+H8hist <- colordistance::getImageHist(image_path, bins=c(1, 1, 2))
+```
+
+```{r create jpg holdout}
+# Number of pixels
+n <- nrow(holdout_data)
+maxHeight <- 65500
+height <- min(n, maxHeight)
+width <- ceiling(n / height)
+total_pixels <- height * width
+
+# Normalize RGB
+r <- holdout_data$Red / 255
+g <- holdout_data$Green / 255
+b <- holdout_data$Blue / 255
+
+# Calculate padding
+pad <- total_pixels - n
+
+# Pad
+if(pad > 0){
+  r <- c(r, rep(0, pad))
+  g <- c(g, rep(1, pad))
+  b <- c(b, rep(0, pad))
+}
+
+# Make array
+img_array <- array(c(matrix(r, nrow = height, ncol = width),
+                     matrix(g, nrow = height, ncol = width),
+                     matrix(b, nrow = height, ncol = width)),
+                   dim = c(height, width, 3))
+
+# Write to jpg
+writeJPEG(img_array, target = "holdout_colors.jpg")
+```
+
+```{r holdout color plot}
+image_path <- "holdout_colors.jpg"
+colordistance::plotPixels(image_path)
+```
+
+```{r pixel prep}
+# Number of pixels
+n <- nrow(train_data)
+maxHeight <- 65500
+height <- min(n, maxHeight)
+width <- ceiling(n / height)
+total_pixels <- height * width
+
+# Normalize RGB
+r <- train_data$Red / 255
+g <- train_data$Green / 255
+b <- train_data$Blue / 255
+
+# Calculate padding
+pad <- total_pixels - n
+
+# Pad
+if(pad > 0){
+  r <- c(r, rep(0, pad))
+  g <- c(g, rep(1, pad))
+  b <- c(b, rep(0, pad))
+}
+
+# Make array
+img_array <- array(c(matrix(r, nrow = height, ncol = width),
+                     matrix(g, nrow = height, ncol = width),
+                     matrix(b, nrow = height, ncol = width)),
+                   dim = c(height, width, 3))
+
+# Write to jpg
+writeJPEG(img_array, target = "train_colors.jpg")
+```
+
+```{r plot train colors}
+image_path <- "train_colors.jpg"
+colordistance::plotPixels(image_path)
+```
+
+```{r holdout data jpg}
+bt_data <- holdout_data %>% 
+  filter(BT == "TRUE")
+
+n <- nrow(bt_data)
+maxHeight <- 65500
+height <- min(n, maxHeight)
+width <- ceiling(n / height)
+total_pixels <- height * width
+
+r <- bt_data$Red / 255
+g <- bt_data$Green / 255
+b <- bt_data$Blue / 255
+
+pad <- total_pixels - n
+
+if(pad > 0){
+  r <- c(r, rep(0, pad))
+  g <- c(g, rep(1, pad))
+  b <- c(b, rep(0, pad))
+}
+
+img_array <- array(
+  c(matrix(r, nrow = height, ncol = width),
+    matrix(g, nrow = height, ncol = width),
+    matrix(b, nrow = height, ncol = width)),
+  dim = c(height, width, 3)
+)
+
+writeJPEG(img_array, target = "holdout_BT.jpg")
+```
+
+```{r holdout blue}
+image_path <- "holdout_BT.jpg"
+H8hist <- colordistance::getImageHist(image_path, bins=c(1, 1, 1))
+```
+
+```{r train blue jpg}
+bt_data <- train_data %>% 
+  filter(BT == "TRUE")
+
+n <- nrow(bt_data)
+maxHeight <- 65500
+height <- min(n, maxHeight)
+width <- ceiling(n / height)
+total_pixels <- height * width
+
+r <- bt_data$Red / 255
+g <- bt_data$Green / 255
+b <- bt_data$Blue / 255
+
+pad <- total_pixels - n
+
+if(pad > 0){
+  r <- c(r, rep(0, pad))
+  g <- c(g, rep(1, pad))
+  b <- c(b, rep(0, pad))
+}
+
+img_array <- array(
+  c(matrix(r, nrow = height, ncol = width),
+    matrix(g, nrow = height, ncol = width),
+    matrix(b, nrow = height, ncol = width)),
+  dim = c(height, width, 3)
+)
+
+writeJPEG(img_array, target = "train_BT.jpg")
+```
+
+```{r train blue}
+image_path <- "train_BT.jpg"
+H8hist <- colordistance::getImageHist(image_path, bins=c(1, 1, 1))
+```
+
+Have a look at the distributioin of the two classes for the outcome named "BT" (for BlueTarp).
+```{r dist of BT}
+#| fig.cap: Distribution of Blue Tarp among all the observations.
+#| fig.width: 5
+#| fig.height: 4
+#| fig.align: center
+#| out.width: 60%
+train_data |> 
+    ggplot(aes(x=BT, fill=BT)) +
+    geom_bar(position="dodge")
+```
+
+I can see that the two outcome classes are extremely unbalanced. I will keep this in mind and deal with it later.
+
+### Methods
+
+#### Model Preprocessing and Feature Selection
+
+Three classification models—logistic regression, linear discriminant analysis (LDA), and quadratic discriminant analysis (QDA)—were trained across three distinct color spaces: RGB (`Red`, `Green`, `Blue`), CIELab (`Luminance`, `a`, `b`), and HSV (`Hue`, `Saturation`, `Value`).
+
+For each model, a `recipe()` function was defined to construct the feature set. No normalization was applied, as all three variables within each color space share the same ranges and units. This decision was made to preserve the original scale of the data and allow for potential coefficient interpretability in logistic regression.
+
+Three distinct feature sets were defined:
+- **RGB:** Predictor variables include `Red`, `Green`, and `Blue`.
+- **CIELab:** Predictor variables include `Luminance`, `a`, and `b`.
+- **HSV:** Predictor variables include `Hue`, `Saturation`, and `Value`.
+
+The response variable, `BT`, was a binary indicator denoting whether a given pixel belonged to a blue tarp (`BT = TRUE`) or not (`BT = FALSE`). The same response variable was used across all three color spaces to ensure direct comparability between models.
+
+Each `recipe()` was applied to its corresponding dataset before training the models.
+
+#### Model Specification and Workflow Definition
+
+For each color space, a logistic regression, LDA, and QDA model were defined and combined into a `workflow()` object. This structure ensures consistency in model training and evaluation.
+
+The following table summarizes the nine model configurations:
+
+```{r 9 models, echo=FALSE}
+#| fig.width: 6
+#| fig.height: 6
+#| fig.cap: Model Type vs. Color Space
+
+# Create a data frame of model and color space combinations
+model_table <- expand.grid(
+  Model = c("Logistic Regression", "LDA", "QDA"),
+  ColorSpace = c("HSV", "CIELab", "RGB")
+)
+
+# Plot as a grid
+ggplot(model_table, aes(x = Model, y = ColorSpace)) +
+  geom_tile(fill = "lightgray", color = "black") +
+  geom_text(aes(label = paste(Model, "\n", ColorSpace)), size = 4) +
+  theme_minimal() +
+  labs(title = "Model Type vs. Color Space") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+```{r set formulas}
+# RGB Model Formula and Recipe
+rgb_formula <- BT ~ Red + Green + Blue
+rgb_recipe <- recipe(rgb_formula, data = train_data)
+
+# CIELab Model Formula and Recipe
+lab_formula <- BT ~ Luminance + a + b
+lab_recipe <- recipe(lab_formula, data = train_data)
+
+# HSV Model Formula and Recipe
+hsv_formula <- BT ~ Hue + Saturation + Value
+hsv_recipe <- recipe(hsv_formula, data = train_data)
+```
+
+```{r specify models}
+# Specify models
+logreg_spec <- logistic_reg(mode="classification", engine="glm")
+lda_spec <- discrim_linear(mode="classification", engine="MASS")
+qda_spec <- discrim_quad(mode="classification", engine="MASS")
+```
+
+```{r define workflows}
+# RGB Models
+logreg_rgb_wf <- workflow() %>% add_recipe(rgb_recipe) %>% add_model(logreg_spec)
+lda_rgb_wf <- workflow() %>% add_recipe(rgb_recipe) %>% add_model(lda_spec)
+qda_rgb_wf <- workflow() %>% add_recipe(rgb_recipe) %>% add_model(qda_spec)
+
+# CIELab Models
+logreg_lab_wf <- workflow() %>% add_recipe(lab_recipe) %>% add_model(logreg_spec)
+lda_lab_wf <- workflow() %>% add_recipe(lab_recipe) %>% add_model(lda_spec)
+qda_lab_wf <- workflow() %>% add_recipe(lab_recipe) %>% add_model(qda_spec)
+
+# HSV Models
+logreg_hsv_wf <- workflow() %>% add_recipe(hsv_recipe) %>% add_model(logreg_spec)
+lda_hsv_wf <- workflow() %>% add_recipe(hsv_recipe) %>% add_model(lda_spec)
+qda_hsv_wf <- workflow() %>% add_recipe(hsv_recipe) %>% add_model(qda_spec)
+```
+
+#### Cross-Validation
+
+A 10-fold cross-validation procedure was implemented using stratified sampling to ensure that each fold maintained the same proportion of positive (`BT = TRUE`) and negative (`BT = FALSE`) cases as the full dataset.
+
+Performance was evaluated using ROC-AUC as the primary metric, with accuracy, precision, and F-measure also recorded for additional comparison. Predictions from each resampling iteration were saved to enable the construction of ROC curves based on cross-validation results, allowing for a detailed examination of model performance across different thresholds.
+
+Each model—logistic regression, LDA, and QDA—was cross-validated separately within its respective color space (RGB, CIELab, and HSV), resulting in a total of nine cross-validation experiments.
+
+```{r cross validation approach}
+# Define cross-validation approach
+set.seed(6030)
+
+resamples <- vfold_cv(train_data, v = 10, strata = BT)
+custom_metrics <- metric_set(roc_auc, accuracy, precision, f_meas)
+cv_control <- control_resamples(save_pred = TRUE)
+```
+
+Cross-validation
+```{r cross validate}
+#| message: FALSE
+#| warning: FALSE
+
+# Cross-validation for RGB models
+logreg_rgb_cv <- fit_resamples(logreg_rgb_wf, resamples, metrics = custom_metrics, control = cv_control)
+lda_rgb_cv <- fit_resamples(lda_rgb_wf, resamples, metrics = custom_metrics, control = cv_control)
+qda_rgb_cv <- fit_resamples(qda_rgb_wf, resamples, metrics = custom_metrics, control = cv_control)
+
+# Cross-validation for CIELab models
+logreg_lab_cv <- fit_resamples(logreg_lab_wf, resamples, metrics = custom_metrics, control = cv_control)
+lda_lab_cv <- fit_resamples(lda_lab_wf, resamples, metrics = custom_metrics, control = cv_control)
+qda_lab_cv <- fit_resamples(qda_lab_wf, resamples, metrics = custom_metrics, control = cv_control)
+
+# Cross-validation for HSV models
+logreg_hsv_cv <- fit_resamples(logreg_hsv_wf, resamples, metrics = custom_metrics, control = cv_control)
+lda_hsv_cv <- fit_resamples(lda_hsv_wf, resamples, metrics = custom_metrics, control = cv_control)
+qda_hsv_cv <- fit_resamples(qda_hsv_wf, resamples, metrics = custom_metrics, control = cv_control)
+```
+
+```{r fit final models on train}
+#| message: FALSE
+#| warning: FALSE
+
+# Fit final models on train_data for RGB
+final_logreg_rgb_fit <- logreg_rgb_wf %>% fit(data = train_data)
+final_lda_rgb_fit    <- lda_rgb_wf %>% fit(data = train_data)
+final_qda_rgb_fit    <- qda_rgb_wf %>% fit(data = train_data)
+
+# Fit final models on train_data for CIELab
+final_logreg_lab_fit <- logreg_lab_wf %>% fit(data = train_data)
+final_lda_lab_fit    <- lda_lab_wf %>% fit(data = train_data)
+final_qda_lab_fit    <- qda_lab_wf %>% fit(data = train_data)
+
+# Fit final models on train_data for HSV
+final_logreg_hsv_fit <- logreg_hsv_wf %>% fit(data = train_data)
+final_lda_hsv_fit    <- lda_hsv_wf %>% fit(data = train_data)
+final_qda_hsv_fit    <- qda_hsv_wf %>% fit(data = train_data)
+```
+
+#### Cross-Validation Performance by Color Space
+
+The table and plot below show the cross-validation performance of logistic regression, LDA, and QDA across three color spaces: RGB, CIELab, and HSV. The metrics include accuracy, F-measure, precision, and ROC-AUC. At this point, no specific threshold has been set; the models are evaluated using the default 0.5 decision boundary. Later sections will discuss threshold tuning in detail. ROC-AUC is emphasized here because it measures the model’s ability to distinguish between positive (blue tarp) and negative (not blue tarp) classes independently of any specific threshold.
+
+Logistic regression and QDA achieve similar accuracy and ROC-AUC, both approaching 0.999 in certain color spaces. LDA shows lower values for F-measure and precision, which indicates a higher rate of misclassifications relative to the other two models. However, its accuracy and ROC-AUC remain close to 0.98 or higher, suggesting that it still separates the classes reasonably well across thresholds.
+
+The RGB and CIELab color spaces yield nearly identical results for logistic regression and QDA, both reaching an accuracy of about 0.995 and an ROC-AUC near 0.998–0.999. CIELab provides a slight improvement for LDA, with an F-measure of 0.776 compared to 0.761 in RGB. HSV’s accuracy is marginally lower (about 0.993–0.994), yet its F-measure is more balanced across all three models. 
+
+Because ROC-AUC is computed independent of setting a decision threshold, it remains the primary indicator of each model’s overall discriminative ability. Both logistic regression and QDA maintain high ROC-AUC scores in all color spaces, indicating strong separation between positive and negative classes without relying on a fixed threshold. LDA remains slightly less effective under the default threshold, but it still achieves a reasonable separation, with ROC-AUC values generally above 0.95.
+
+No specific threshold tuning has been performed yet. Future steps will explore how threshold adjustment affects metrics such as F-measure and precision for each model-color space combination.
+
+```{r cv metrics}
+# Organize cross-validation metrics
+
+cv_metrics <- bind_rows(
+    # RGB models
+    collect_metrics(logreg_rgb_cv) %>% mutate(model = "Logistic Regression", color_space = "RGB"),
+    collect_metrics(lda_rgb_cv) %>% mutate(model = "LDA", color_space = "RGB"),
+    collect_metrics(qda_rgb_cv) %>% mutate(model = "QDA", color_space = "RGB"),
+    
+    # CIELab models
+    collect_metrics(logreg_lab_cv) %>% mutate(model = "Logistic Regression", color_space = "CIELab"),
+    collect_metrics(lda_lab_cv) %>% mutate(model = "LDA", color_space = "CIELab"),
+    collect_metrics(qda_lab_cv) %>% mutate(model = "QDA", color_space = "CIELab"),
+    
+    # HSV models
+    collect_metrics(logreg_hsv_cv) %>% mutate(model = "Logistic Regression", color_space = "HSV"),
+    collect_metrics(lda_hsv_cv) %>% mutate(model = "LDA", color_space = "HSV"),
+    collect_metrics(qda_hsv_cv) %>% mutate(model = "QDA", color_space = "HSV")
+)
+
+
+# Create the table
+table_kable <- cv_metrics %>%
+    select(color_space, model, .metric, mean) %>%
+    pivot_wider(names_from = .metric, values_from = mean) %>%
+    arrange(factor(color_space, levels = c("RGB", "CIELab", "HSV")),
+            factor(model, levels = c("Logistic Regression", "LDA", "QDA"))) %>%
+    knitr::kable(
+      caption = "Cross-validation performance metrics by color space.",
+      digits = 3,
+      col.names = c("Color Space", "Model", "Accuracy", "F-measure", "Precision", "ROC-AUC")
+    ) %>%
+    kableExtra::kable_styling(full_width = FALSE, position = "center") %>%
+    kableExtra::collapse_rows(columns = 1, valign = "top")
+
+table_kable
+
+# Save the table
+save_kable(table_kable, file = "cv_metrics_table.png", zoom = 2)
+```
+
+```{r cv-metrics-figure}
+#| fig.cap: Cross-validation performance metrics by color space.
+#| fig.width: 8
+#| fig.height: 4
+#| out.width: "75%"
+#| warning: FALSE
+#| message: FALSE
+
+cv_metrics %>%
+  mutate(
+    model = factor(model, levels = c("QDA", "LDA", "Logistic Regression")),
+    color_space = factor(color_space, levels = c("RGB", "CIELab", "HSV"))
+  ) %>%
+  ggplot(aes(
+    x = mean,
+    y = model,
+    xmin = mean - std_err,
+    xmax = mean + std_err,
+    color = color_space
+  )) +
+  geom_point() +
+  geom_linerange() +
+  facet_wrap(~ .metric, scales = "free_x") +
+  labs(
+    x = "Estimated Metric Value",
+    y = "Model",
+    color = "Color Space"
+  ) +
+  scale_y_discrete(limits = c("QDA", "LDA", "Logistic Regression")) +
+  scale_color_discrete(limits = c("RGB", "CIELab", "HSV"))
+
+ggsave("cv_metrics_plot.png", width = 8, height = 6, dpi = 300)
+```
+
+#### ROC Curves by Color Space
+
+In the figure below, each panel displays the ROC curve for logistic regression, LDA, and QDA within a given color space (RGB, CIELab, and HSV). The curves illustrate how each model’s sensitivity evolves as the false-positive rate (1 – specificity) increases.
+
+In the RGB and CIELab panels, both logistic regression and QDA reach near-perfect classification quickly, with very little area left above the curves. LDA remains consistently lower, indicating a reduced ability to separate the classes at most thresholds. The similar performance between RGB and CIELab is evident in how closely the curves for these two color spaces align.
+
+The HSV panel shows that all three models require a slightly higher false-positive rate before attaining the same level of sensitivity observed in RGB and CIELab. LDA in HSV trails the other two models further, never fully approaching a sensitivity of 1. This indicates that in HSV, both false-positive rates and false-negative rates are somewhat higher compared to the other color spaces, particularly for the LDA model.
+
+Across all color spaces, logistic regression and QDA yield high ROC-AUC values. LDA underperforms in comparison, with its curve consistently lying below those of the other two models. The marginal difference between RGB and CIELab curves suggests that both color spaces provide similar predictive power, whereas the HSV models lag slightly, requiring a higher trade-off (i.e., higher false-positive rate) for the same level of sensitivity.
+
+```{r cv-roc-curves-overlay}
+#| fig.width: 16
+#| fig.height: 5
+#| fig.cap: Cross-validation ROC curves for each color space
+
+# RGB Models
+rgb_roc <- bind_rows(
+    collect_predictions(logreg_rgb_cv) %>% mutate(model = "Logistic Regression"),
+    collect_predictions(lda_rgb_cv) %>% mutate(model = "LDA"),
+    collect_predictions(qda_rgb_cv) %>% mutate(model = "QDA")
+) %>%
+    group_by(model) %>%
+    roc_curve(truth = BT, .pred_TRUE, event_level = "first") %>%
+    autoplot() +
+    ggtitle("ROC Curve - RGB Models") +
+    theme_minimal()
+
+# CIELab Models
+lab_roc <- bind_rows(
+    collect_predictions(logreg_lab_cv) %>% mutate(model = "Logistic Regression"),
+    collect_predictions(lda_lab_cv) %>% mutate(model = "LDA"),
+    collect_predictions(qda_lab_cv) %>% mutate(model = "QDA")
+) %>%
+    group_by(model) %>%
+    roc_curve(truth = BT, .pred_TRUE, event_level = "first") %>%
+    autoplot() +
+    ggtitle("ROC Curve - CIELab Models") +
+    theme_minimal()
+
+# HSV Models
+hsv_roc <- bind_rows(
+    collect_predictions(logreg_hsv_cv) %>% mutate(model = "Logistic Regression"),
+    collect_predictions(lda_hsv_cv) %>% mutate(model = "LDA"),
+    collect_predictions(qda_hsv_cv) %>% mutate(model = "QDA")
+) %>%
+    group_by(model) %>%
+    roc_curve(truth = BT, .pred_TRUE, event_level = "first") %>%
+    autoplot() +
+    ggtitle("ROC Curve - HSV Models") +
+    theme_minimal()
+
+rgb_roc + lab_roc + hsv_roc
+
+ggsave("cv_roc_curves_overlay.png", 
+       plot = rgb_roc + lab_roc + hsv_roc, 
+       width = 16, height = 5, dpi = 300)
+```
+
+#### Threshold Selection and Optimization
+
+In many real-world classification tasks, the proportion of positive and negative cases is highly imbalanced. This dataset exhibits similar characteristics, prompting the need to adjust the decision threshold. A single default threshold (often 0.5) may overlook numerous minority-class instances or inflate false positives.
+
+We use the `probably` package to systematically evaluate how varying the threshold affects metrics such as `accuracy`, `f_meas`, and `sens`. These three measures were chosen based on their direct relevance to the final application. A high sensitivity (`sens`) is desirable when missed positives have serious implications, while `f_meas` balances precision and recall to address the importance of correct positive classifications. Accuracy remains useful for an overall check, though it can be misleading in highly imbalanced settings.
+
+Two functions are defined to explore threshold selection and illustrate the resulting confusion matrices:
+- `threshold_graph` scans multiple thresholds and collects metrics computed by `threshold_perf`.
+- `visualize_conf_mat` produces confusion matrices for specific thresholds selected from the metrics output.
+
+```{r threshold graphs 1}
+threshold_graph <- function(model_cv, model_name) {
+    performance <- probably::threshold_perf(collect_predictions(model_cv), BT, .pred_TRUE,
+        thresholds=seq(0.01, 0.99, 0.01), event_level="first",
+        metrics=metric_set(f_meas, accuracy, sens))
+    max_metrics <- performance %>%
+        drop_na() %>%
+        group_by(.metric) %>%
+        filter(.estimate == max(.estimate))
+    g <- ggplot(performance, aes(x=.threshold, y=.estimate, color=.metric)) +
+        geom_line() +
+        geom_point(data=max_metrics, color="black") +
+        labs(title=model_name, x="Threshold", y="Metric value") +
+        coord_cartesian(ylim=c(0, 1))
+    thresholds <- max_metrics %>%
+        select(.metric, .threshold) %>%
+        deframe()
+    return(list(graph=g, thresholds=thresholds))
+}
+
+visualize_conf_mat <- function(model_cv, thresholds, metric) {
+    threshold <- thresholds[metric]
+    cm <- collect_predictions(model_cv) %>%
+        mutate(
+            .pred_class = make_two_class_pred(.pred_TRUE, c("TRUE", "FALSE"), threshold=threshold),
+        ) %>%
+        conf_mat(truth=BT, estimate=.pred_class)
+    autoplot(cm, type="heatmap") +
+        labs(title=sprintf("Threshold %.2f (%s)", threshold, metric))
+}
+
+overview_model <- function(model_cv, model_name) {
+    tg <- threshold_graph(model_cv, model_name)
+    g1 <- visualize_conf_mat(model_cv, tg$thresholds, "accuracy")
+    g2 <- visualize_conf_mat(model_cv, tg$thresholds, "f_meas")
+    g3 <- visualize_conf_mat(model_cv, tg$thresholds, "sens")
+    tg$graph + (g1 / g2 / g3)
+}
+```
+
+#### Threshold Tuning by Color Space
+
+The figures below shows threshold tuning for logistic regression, LDA, and QDA across RGB, CIELab, and HSV. Each panel presents three metrics—accuracy, F-measure, and sensitivity—plotted against the decision threshold. Confusion matrices highlight the effect of selecting specific thresholds that maximize each metric.
+
+In RGB and CIELab, the models yield similar patterns, reaching high metric values around comparable thresholds. HSV diverges somewhat, particularly in the LDA and QDA models where each metric has a similar value across all thresholds.
+
+In this application, classifying blue tarps in satellite imagery for humanitarian aid, there is a strong need to balance precision (avoiding too many false alarms) with recall (finding as many actual tarps as possible). F-measure provides a middle ground, penalizing both missed targets and erroneous detections. Optimizing for sensitivity alone results in a large number of false positives, which demands additional field validation and can slow down response efforts. F-measure is therefore favored to maintain a reasonable rate of correct detections without overwhelming humanitarian workers and remote sensing specialists with false alarms.
+
+```{r threshold measure apply function}
+# RGB Models
+rgb_g1 <- overview_model(logreg_rgb_cv, "Logistic Regression (RGB)")
+rgb_g2 <- overview_model(lda_rgb_cv, "LDA (RGB)")
+rgb_g3 <- overview_model(qda_rgb_cv, "QDA (RGB)")
+
+# CIELab Models
+lab_g1 <- overview_model(logreg_lab_cv, "Logistic Regression (CIELab)")
+lab_g2 <- overview_model(lda_lab_cv, "LDA (CIELab)")
+lab_g3 <- overview_model(qda_lab_cv, "QDA (CIELab)")
+
+# HSV Models
+hsv_g1 <- overview_model(logreg_hsv_cv, "Logistic Regression (HSV)")
+hsv_g2 <- overview_model(lda_hsv_cv, "LDA (HSV)")
+hsv_g3 <- overview_model(qda_hsv_cv, "QDA (HSV)")
+```
+
+```{r print first threshold imgs}
+#| fig.width: 20
+#| fig.height: 15
+#| out.width: 100%
+#| fig.cap: Metrics as a function of threshold optimization across all color spaces.
+#| warning: FALSE
+# Arrange in 3 rows (RGB, CIELab, HSV)
+combined_threshold_plots <- (rgb_g1 | rgb_g2 | rgb_g3) /
+                            (lab_g1 | lab_g2 | lab_g3) /
+                            (hsv_g1 | hsv_g2 | hsv_g3)
+
+# Print the combined plot
+combined_threshold_plots
+
+ggsave("combined_threshold_plots.png", plot = combined_threshold_plots, width = 20, height = 15, dpi = 600)
+```
+
+#### Adjusting the F-Measure Weight
+
+While F-measure (`f_meas`) balances precision and recall, it places equal weight on both by default. In some domains, avoiding missed detections (false negatives) is critical, prompting an increase in the weight of recall relative to precision. One approach is to adjust the F-measure parameter `beta`, where higher values of `beta` emphasize recall over precision.
+
+In this research, the `yardstick` package’s `metric_tweak` function was used to create custom F-measure metrics (`f_meas_adj2` with `beta = 2` and `f_meas_adj3` with `beta = 3`). These metrics were applied at a range of thresholds for logistic regression, LDA, and QDA, providing an in-depth view of how heavily prioritizing recall affects overall performance.
+
+Although placing additional weight on recall reduces missed blue tarps, the number of false positives increased sharply. For instance, in the RGB color space, adjusting `beta` to 3 for logistic regression produced 1,960 true positives but 545 false positives, with only 62 missed detections. This outcome was deemed problematic, as every false-positive pixel would require manual validation, slowing humanitarian response efforts.
+
+After comparing these adjusted metrics to the unmodified F-measure, we concluded that the added recall did not justify the sharp rise in false positives. The default F-measure strikes a more balanced trade-off between precision and recall for our application, avoiding undue burden on field workers who must verify each potential target. Consequently, the unadjusted F-measure (`f_meas`) was retained as our preferred optimization metric.
+
+```{r threshold graphs f_meas}
+# Tweak f measure
+f_meas_adj2 <- metric_tweak("f_meas_adj2", f_meas, beta = 2)
+f_meas_adj3 <- metric_tweak("f_meas_adj3", f_meas, beta = 3)
+
+threshold_graph <- function(model_cv, model_name) {
+    performance <- probably::threshold_perf(collect_predictions(model_cv), BT, .pred_TRUE,
+        thresholds=seq(0.01, 0.99, 0.01), event_level="first",
+        metrics=metric_set(f_meas, f_meas_adj2, f_meas_adj3))
+    max_metrics <- performance %>%
+        drop_na() %>%
+        group_by(.metric) %>%
+        filter(.estimate == max(.estimate))
+    g <- ggplot(performance, aes(x=.threshold, y=.estimate, color=.metric)) +
+        geom_line() +
+        geom_point(data=max_metrics, color="black") +
+        labs(title=model_name, x="Threshold", y="Metric value") +
+        coord_cartesian(ylim=c(0, 1))
+    thresholds <- max_metrics %>%
+        select(.metric, .threshold) %>%
+        deframe()
+    return(list(graph=g, thresholds=thresholds))
+}
+
+visualize_conf_mat <- function(model_cv, thresholds, metric) {
+    threshold <- thresholds[metric]
+    cm <- collect_predictions(model_cv) %>%
+        mutate(
+            .pred_class = make_two_class_pred(.pred_TRUE, c("TRUE", "FALSE"), threshold=threshold),
+        ) %>%
+        conf_mat(truth=BT, estimate=.pred_class)
+    autoplot(cm, type="heatmap") +
+        labs(title=sprintf("Threshold %.2f \n(%s)", threshold, metric))
+}
+
+overview_model <- function(model_cv, model_name) {
+    tg <- threshold_graph(model_cv, model_name)
+    g1 <- visualize_conf_mat(model_cv, tg$thresholds, "f_meas")
+    g2 <- visualize_conf_mat(model_cv, tg$thresholds, "f_meas_adj2")
+    g3 <- visualize_conf_mat(model_cv, tg$thresholds, "f_meas_adj3")
+    tg$graph + (g1 / g2 / g3)
+}
+```
+
+```{r adj fmeasure plots}
+#| fig.width: 20
+#| fig.height: 17
+#| out.width: 100%
+#| fig.cap: F-measure metrics as a function of threshold optimization across all color spaces.
+#| warning: FALSE
+
+# RGB models
+rgb_g1 <- overview_model(logreg_rgb_cv, "Logistic Regression (RGB)")
+rgb_g2 <- overview_model(lda_rgb_cv, "LDA (RGB)")
+rgb_g3 <- overview_model(qda_rgb_cv, "QDA (RGB)")
+
+# CIELab models
+lab_g1 <- overview_model(logreg_lab_cv, "Logistic Regression (CIELab)")
+lab_g2 <- overview_model(lda_lab_cv, "LDA (CIELab)")
+lab_g3 <- overview_model(qda_lab_cv, "QDA (CIELab)")
+
+# HSV models
+hsv_g1 <- overview_model(logreg_hsv_cv, "Logistic Regression (HSV)")
+hsv_g2 <- overview_model(lda_hsv_cv, "LDA (HSV)")
+hsv_g3 <- overview_model(qda_hsv_cv, "QDA (HSV)")
+```
+
+```{r comb and save fmeas plots}
+#| fig.width: 20
+#| fig.height: 15
+#| out.width: 100%
+#| fig.cap: F-measure metrics as a function of threshold optimization across all color spaces.
+#| warning: FALSE
+# Combine
+combined_f_meas_plots <- (rgb_g1 | rgb_g2 | rgb_g3) /
+                         (lab_g1 | lab_g2 | lab_g3) /
+                         (hsv_g1 | hsv_g2 | hsv_g3)
+
+
+print(combined_f_meas_plots)
+
+# Save
+ggsave("combined_f_meas_plots.png", plot = combined_f_meas_plots, width = 20, height = 15, dpi = 600)
+```
+
+### Final Model Fitting on Training Data
+
+After evaluating performance in the cross-validation folds, each model was fit to the entire training dataset. The ROC-AUC curves for these full-training fits closely align with those obtained from the cross-validation predictions, suggesting that none of the nine models (logistic regression, LDA, or QDA in RGB, CIELab, or HSV) exhibits substantial overfitting at this stage. Each model’s performance remains consistent when trained on the complete dataset.
+
+These curves are nearly identical, reinforcing the conclusion that the additional training data did not inflate performance metrics in a way indicative of overfitting. On this basis, the final fitted models serve as reliable starting points for subsequent predictive analyses on the holdout set.
+
+```{r roc overlay plots check cv full}
+#| fig.width: 12
+#| fig.height: 9
+#| fig.cap: ROC curve comparison between cross-validation and full data set predictions
+#| warning: FALSE
+
+# Function to generate ROC overlay plots
+get_roc_overlay_autoplot <- function(cv_object, wf, data, model_name) {
+  # Fit the full model
+  full_fit <- wf %>% fit(data)
+  
+  # Get CV preds
+  cv_preds <- collect_predictions(cv_object) %>% 
+    mutate(source = "CV")
+  
+  # Get preds for full model
+  full_preds <- augment(full_fit, new_data = data) %>% 
+    mutate(source = "Full")
+  
+  # Compute ROC
+  roc_data <- bind_rows(cv_preds, full_preds) %>%
+    group_by(source) %>%
+    roc_curve(truth = BT, .pred_TRUE, event_level = "first")
+  
+  # Use autoplot
+  autoplot(roc_data) +
+    ggtitle(paste(model_name)) +
+    theme_minimal()
+}
+
+# Generate ROC overlay plots for each model
+
+## RGB Models
+p_logreg_rgb <- get_roc_overlay_autoplot(logreg_rgb_cv, logreg_rgb_wf, train_data, "Logistic Regression (RGB)")
+p_lda_rgb    <- get_roc_overlay_autoplot(lda_rgb_cv, lda_rgb_wf, train_data, "LDA (RGB)")
+p_qda_rgb    <- get_roc_overlay_autoplot(qda_rgb_cv, qda_rgb_wf, train_data, "QDA (RGB)")
+
+## CIELab Models
+p_logreg_lab <- get_roc_overlay_autoplot(logreg_lab_cv, logreg_lab_wf, train_data, "Logistic Regression (CIELab)")
+p_lda_lab    <- get_roc_overlay_autoplot(lda_lab_cv, lda_lab_wf, train_data, "LDA (CIELab)")
+p_qda_lab    <- get_roc_overlay_autoplot(qda_lab_cv, qda_lab_wf, train_data, "QDA (CIELab)")
+
+## HSV Models
+p_logreg_hsv <- get_roc_overlay_autoplot(logreg_hsv_cv, logreg_hsv_wf, train_data, "Logistic Regression (HSV)")
+p_lda_hsv    <- get_roc_overlay_autoplot(lda_hsv_cv, lda_hsv_wf, train_data, "LDA (HSV)")
+p_qda_hsv    <- get_roc_overlay_autoplot(qda_hsv_cv, qda_hsv_wf, train_data, "QDA (HSV)")
+
+# Combine plots
+combined_roc <- (p_logreg_rgb + p_lda_rgb + p_qda_rgb) / 
+                (p_logreg_lab + p_lda_lab + p_qda_lab) / 
+                (p_logreg_hsv + p_lda_hsv + p_qda_hsv) +
+                plot_annotation(title = "Overlay of ROC Curves (CV vs. Full Data Predictions)")
+
+combined_roc
+```
+
+```{r save roc plots}
+ggsave("combined_roc.png", plot = combined_roc, width = 12, height = 9, dpi = 600)
+```
+
+#### Alternate Presentation: Comparing ROC-AUC from Cross-Validation and Full Training
+
+While the previous figure overlays the ROC curves for cross-validation (CV) and full-training fits, an additional way to highlight potential overfitting is to compute the ROC-AUC under both conditions and compare the results directly in a table. This approach provides a numeric indication of whether the model’s performance changes substantially when trained on the full dataset.
+
+For each of the nine model–color space combinations:
+1. Compute ROC-AUC from cross-validation predictions.  
+2. Fit the model on the full training dataset, then compute the ROC-AUC on the same dataset.  
+3. Calculate the difference between these two values.
+
+A small difference implies little or no overfitting, indicating that training on the entire dataset does not artificially inflate performance metrics. The table confirms that the difference in the performance metrics between the mean of the cross-validated folds and the metric of a fitted model are miniscule, confirming little or no overfitting.
+
+```{r compare roc-auc cv and full train}
+compute_roc_diff <- function(cv_object, workflow, train_data) {
+  # Cross-validation ROC-AUC (mean value)
+  cv_roc <- collect_metrics(cv_object) %>%
+    filter(.metric == "roc_auc") %>%
+    pull(mean)
+  
+  # Fit the model
+  final_fit <- workflow %>% fit(train_data)
+  
+  # Evaluate ROC-AUC
+  full_preds <- augment(final_fit, new_data = train_data)
+  
+  full_roc <- roc_auc(full_preds, truth = BT, .pred_TRUE, event_level = "first") %>%
+    pull(.estimate)
+  
+  # Return a tibble with ROC values and their difference
+  tibble(
+    cv_roc = cv_roc,
+    full_roc = full_roc,
+    diff = full_roc - cv_roc
+  )
+}
+
+roc_diff_results <- bind_rows(
+  compute_roc_diff(logreg_rgb_cv, logreg_rgb_wf, train_data) %>% 
+    mutate(model = "Logistic Regression", color_space = "RGB"),
+  compute_roc_diff(lda_rgb_cv, lda_rgb_wf, train_data) %>% 
+    mutate(model = "LDA", color_space = "RGB"),
+  compute_roc_diff(qda_rgb_cv, qda_rgb_wf, train_data) %>% 
+    mutate(model = "QDA", color_space = "RGB"),
+  
+  compute_roc_diff(logreg_lab_cv, logreg_lab_wf, train_data) %>% 
+    mutate(model = "Logistic Regression", color_space = "CIELab"),
+  compute_roc_diff(lda_lab_cv, lda_lab_wf, train_data) %>% 
+    mutate(model = "LDA", color_space = "CIELab"),
+  compute_roc_diff(qda_lab_cv, qda_lab_wf, train_data) %>% 
+    mutate(model = "QDA", color_space = "CIELab"),
+  
+  compute_roc_diff(logreg_hsv_cv, logreg_hsv_wf, train_data) %>% 
+    mutate(model = "Logistic Regression", color_space = "HSV"),
+  compute_roc_diff(lda_hsv_cv, lda_hsv_wf, train_data) %>% 
+    mutate(model = "LDA", color_space = "HSV"),
+  compute_roc_diff(qda_hsv_cv, qda_hsv_wf, train_data) %>% 
+    mutate(model = "QDA", color_space = "HSV")
+)
+
+roc_diff_results <- roc_diff_results %>%
+  mutate(
+    color_space = factor(color_space, levels = c("RGB", "CIELab", "HSV")),
+    model = factor(model, levels = c("Logistic Regression", "LDA", "QDA"))
+  ) %>%
+  arrange(color_space, model) %>%
+  select(color_space, model, cv_roc, full_roc, diff) %>%
+  kable(
+    caption = "Comparison of ROC-AUC between cross-validation and full-training fits",
+    digits = 6,
+    col.names = c("Color Space", "Model", "ROC-AUC of CV Folds", "ROC-AUC of Fitted Model", "Difference")
+  ) %>%
+  kable_styling(full_width = FALSE) %>%
+  collapse_rows(columns = 1, valign = "top")
+
+roc_diff_results
+```
+
+```{r save roc cv kable}
+save_kable(roc_diff_results, file = "roc_diff_results.png", zoom = 2)
+```
+
+### Evaluation on the Holdout Set
+
+After confirming that our models do not exhibit excessive overfitting when trained on the full dataset, we apply them to the holdout data. Each model–color space pair undergoes a threshold scan using the same `f_meas` metric chosen earlier. This process identifies the threshold on the holdout set that maximizes the F-measure.
+
+```{r optimal thresholds}
+# Find optimal thresholds
+threshold_scan <- function(model, data, model_name) {
+  threshold_data <- model %>%
+    augment(data) %>%
+    probably::threshold_perf(
+      truth = BT,
+      estimate = .pred_TRUE,
+      thresholds = seq(0.01, 0.99, 0.01),
+      event_level = "first",
+      metrics = metric_set(f_meas)
+    )
+  opt_threshold <- threshold_data %>%
+    drop_na() %>%
+    arrange(desc(.estimate)) %>%
+    slice(1)
+  list(
+    threshold = opt_threshold$.threshold,
+    threshold_data = threshold_data,
+    opt_threshold = opt_threshold,
+    model_name = model_name
+  )
+}
+```
+
+```{r scan threshold holdout, eval=FALSE}
+# This codeblock is set to eval=FALSE to speed up processing and knitting
+# If the scans need to be run again, it should be set to TRUE
+
+# Threshold scanning
+logreg_rgb_result <- threshold_scan(final_logreg_rgb_fit, holdout_data, "Logistic Regression (RGB)")
+lda_rgb_result    <- threshold_scan(final_lda_rgb_fit, holdout_data, "LDA (RGB)")
+qda_rgb_result    <- threshold_scan(final_qda_rgb_fit, holdout_data, "QDA (RGB)")
+
+logreg_lab_result <- threshold_scan(final_logreg_lab_fit, holdout_data, "Logistic Regression (CIELab)")
+lda_lab_result    <- threshold_scan(final_lda_lab_fit, holdout_data, "LDA (CIELab)")
+qda_lab_result    <- threshold_scan(final_qda_lab_fit, holdout_data, "QDA (CIELab)")
+
+logreg_hsv_result <- threshold_scan(final_logreg_hsv_fit, holdout_data, "Logistic Regression (HSV)")
+lda_hsv_result    <- threshold_scan(final_lda_hsv_fit, holdout_data, "LDA (HSV)")
+qda_hsv_result    <- threshold_scan(final_qda_hsv_fit, holdout_data, "QDA (HSV)")
+
+# Save the threshold scans locally
+saveRDS(logreg_rgb_result, "logreg_rgb_result.rds")
+saveRDS(lda_rgb_result, "lda_rgb_result.rds")
+saveRDS(qda_rgb_result, "qda_rgb_result.rds")
+
+saveRDS(logreg_lab_result, "logreg_lab_result.rds")
+saveRDS(lda_lab_result, "lda_lab_result.rds")
+saveRDS(qda_lab_result, "qda_lab_result.rds")
+
+saveRDS(logreg_hsv_result, "logreg_hsv_result.rds")
+saveRDS(lda_hsv_result, "lda_hsv_result.rds")
+saveRDS(qda_hsv_result, "qda_hsv_result.rds")
+```
+
+```{r load previous scan results, eval=TRUE}
+# This codeblock is set to eval=TRUE to speed up processing and knitting
+# If the scans need to be run again, it should be set to FALSE
+
+# Load previous results
+logreg_rgb_result <- readRDS("logreg_rgb_result.rds")
+lda_rgb_result    <- readRDS("lda_rgb_result.rds")
+qda_rgb_result    <- readRDS("qda_rgb_result.rds")
+
+logreg_lab_result <- readRDS("logreg_lab_result.rds")
+lda_lab_result    <- readRDS("lda_lab_result.rds")
+qda_lab_result    <- readRDS("qda_lab_result.rds")
+
+logreg_hsv_result <- readRDS("logreg_hsv_result.rds")
+lda_hsv_result    <- readRDS("lda_hsv_result.rds")
+qda_hsv_result    <- readRDS("qda_hsv_result.rds")
+```
+
+```{r optimal thresholds set}
+# Optimal thresholds
+logreg_rgb_holdout_threshold <- logreg_rgb_result$threshold
+lda_rgb_holdout_threshold    <- lda_rgb_result$threshold
+qda_rgb_holdout_threshold    <- qda_rgb_result$threshold
+
+logreg_lab_holdout_threshold <- logreg_lab_result$threshold
+lda_lab_holdout_threshold    <- lda_lab_result$threshold
+qda_lab_holdout_threshold    <- qda_lab_result$threshold
+
+logreg_hsv_holdout_threshold <- logreg_hsv_result$threshold
+lda_hsv_holdout_threshold    <- lda_hsv_result$threshold
+qda_hsv_holdout_threshold    <- qda_hsv_result$threshold
+```
+
+```{r optimal thresholds insert numbers, eval=FALSE}
+# This codeblock is set to eval=TRUE to speed up processing and knitting
+# If the scans need to be run again, it should be set to FALSE
+
+# Optimal thresholds
+logreg_rgb_holdout_threshold <- 0.99
+lda_rgb_holdout_threshold    <- 0.73
+qda_rgb_holdout_threshold    <- 0.53
+
+logreg_lab_holdout_threshold <- 0.99
+lda_lab_holdout_threshold    <- 0.99
+qda_lab_holdout_threshold    <- 0.69
+
+logreg_hsv_holdout_threshold <- 0.13
+lda_hsv_holdout_threshold    <- 0.99
+qda_hsv_holdout_threshold    <- 0.99
+```
+
+```{r scan threshold cv}
+threshold_scan_cv <- function(cv_obj, model_name) {
+  threshold_data <- cv_obj %>%
+    collect_predictions() %>%
+    probably::threshold_perf(
+      truth = BT,
+      estimate = .pred_TRUE,
+      thresholds = seq(0.05, 0.95, 0.01),
+      event_level = "first",
+      metrics = metric_set(f_meas)
+    )
+  opt_threshold <- threshold_data %>%
+    drop_na() %>%
+    arrange(desc(.estimate)) %>%
+    slice(1)
+  list(
+    threshold = opt_threshold$.threshold
+  )
+}
+
+# Compute thresholds
+
+## RGB Models
+logreg_rgb_train_result <- threshold_scan_cv(logreg_rgb_cv, "Logistic Regression (RGB)")
+lda_rgb_train_result    <- threshold_scan_cv(lda_rgb_cv, "LDA (RGB)")
+qda_rgb_train_result    <- threshold_scan_cv(qda_rgb_cv, "QDA (RGB)")
+
+## CIELab Models
+logreg_lab_train_result <- threshold_scan_cv(logreg_lab_cv, "Logistic Regression (CIELab)")
+lda_lab_train_result    <- threshold_scan_cv(lda_lab_cv, "LDA (CIELab)")
+qda_lab_train_result    <- threshold_scan_cv(qda_lab_cv, "QDA (CIELab)")
+
+## HSV Models
+logreg_hsv_train_result <- threshold_scan_cv(logreg_hsv_cv, "Logistic Regression (HSV)")
+lda_hsv_train_result    <- threshold_scan_cv(lda_hsv_cv, "LDA (HSV)")
+qda_hsv_train_result    <- threshold_scan_cv(qda_hsv_cv, "QDA (HSV)")
+
+# Extract optimal thresholds
+
+## RGB
+logreg_rgb_train_threshold <- logreg_rgb_train_result$threshold
+lda_rgb_train_threshold    <- lda_rgb_train_result$threshold
+qda_rgb_train_threshold    <- qda_rgb_train_result$threshold
+
+## CIELab
+logreg_lab_train_threshold <- logreg_lab_train_result$threshold
+lda_lab_train_threshold    <- lda_lab_train_result$threshold
+qda_lab_train_threshold    <- qda_lab_train_result$threshold
+
+## HSV
+logreg_hsv_train_threshold <- logreg_hsv_train_result$threshold
+lda_hsv_train_threshold    <- lda_hsv_train_result$threshold
+qda_hsv_train_threshold    <- qda_hsv_train_result$threshold
+```
+
+The figure below displays the F-measure across thresholds for logistic regression, LDA, and QDA in each color space, illustrating how model performance changes with different thresholds. We see that the RGB and CEILab logistic regression models outperform all other models with achieving the highest f-measure. We also see that for those two models, the relationship is linear between threshold and f-measure performance: as the threshold increases and the model only classifies those pixels that can be most confidently classified as being a blue-tarp are indeed classified, the model performance by the f-measure increases.
+
+```{r combine threshold graphs}
+#| fig.width: 12
+#| fig.height: 9
+#| fig.cap: F-Measure by threshold for each model and color space
+#| warning: FALSE
+
+# Function to plot threshold performance
+plot_threshold <- function(result) {
+  ggplot(result$threshold_data, aes(x = .threshold, y = .estimate)) +
+    geom_line() +
+    geom_point(data = result$opt_threshold, color = "red", size = 2) +
+    labs(title = result$model_name, x = "Threshold", y = "F-Measure") +
+    coord_cartesian(ylim = c(0, 1))
+}
+
+## RGB
+g_logreg_rgb <- plot_threshold(logreg_rgb_result)
+g_lda_rgb    <- plot_threshold(lda_rgb_result)
+g_qda_rgb    <- plot_threshold(qda_rgb_result)
+
+## CIELab
+g_logreg_lab <- plot_threshold(logreg_lab_result)
+g_lda_lab    <- plot_threshold(lda_lab_result)
+g_qda_lab    <- plot_threshold(qda_lab_result)
+
+## HSV
+g_logreg_hsv <- plot_threshold(logreg_hsv_result)
+g_lda_hsv    <- plot_threshold(lda_hsv_result)
+g_qda_hsv    <- plot_threshold(qda_hsv_result)
+
+# Combine plots
+combined_thresholds <- (g_logreg_rgb + g_lda_rgb + g_qda_rgb) /
+                       (g_logreg_lab + g_lda_lab + g_qda_lab) /
+                       (g_logreg_hsv + g_lda_hsv + g_qda_hsv) +
+                       plot_annotation(title = "Threshold Performance (F-Measure) Across Color Spaces")
+
+combined_thresholds
+
+ggsave("combined_thresholds.png", plot = combined_thresholds, width = 12, height = 9, dpi = 600)
+```
+
+```{r model evaluation functions}
+predict_at_threshold <- function(model, data, threshold) {
+  model %>%
+    augment(data) %>%
+    mutate(
+      .pred_class = make_two_class_pred(
+        .pred_TRUE,
+        c("TRUE", "FALSE"),
+        threshold = threshold
+      )
+    )
+}
+
+calculate_metrics_at_threshold <- function(
+  model,
+  train,
+  holdout,
+  model_name,
+  color_space,
+  train_threshold,
+  holdout_threshold
+) {
+  bind_rows(
+    # Metrics for the training set
+    bind_cols(
+      color_space = color_space,
+      model = model_name,
+      dataset = "train",
+      threshold = train_threshold,
+      metrics(predict_at_threshold(model, train, train_threshold), truth = BT, estimate = .pred_class)
+    ),
+    bind_cols(
+      color_space = color_space,
+      model = model_name,
+      dataset = "train",
+      threshold = train_threshold,
+      roc_auc(model %>% augment(train), truth = BT, .pred_TRUE, event_level = "first")
+    ),
+    bind_cols(
+      color_space = color_space,
+      model = model_name,
+      dataset = "train",
+      threshold = train_threshold,
+      f_meas(predict_at_threshold(model, train, train_threshold), truth = BT, estimate = .pred_class)
+    ),
+    bind_cols(
+      color_space = color_space,
+      model = model_name,
+      dataset = "train",
+      threshold = train_threshold,
+      sens(predict_at_threshold(model, train, train_threshold), truth = BT, estimate = .pred_class)
+    ),
+    # Metrics for the holdout set
+    bind_cols(
+      color_space = color_space,
+      model = model_name,
+      dataset = "holdout",
+      threshold = holdout_threshold,
+      metrics(predict_at_threshold(model, holdout, holdout_threshold), truth = BT, estimate = .pred_class)
+    ),
+    bind_cols(
+      color_space = color_space,
+      model = model_name,
+      dataset = "holdout",
+      threshold = holdout_threshold,
+      roc_auc(model %>% augment(holdout), BT, .pred_TRUE, event_level = "first")
+    ),
+    bind_cols(
+      color_space = color_space,
+      model = model_name,
+      dataset = "holdout",
+      threshold = holdout_threshold,
+      f_meas(predict_at_threshold(model, holdout, holdout_threshold), truth = BT, estimate = .pred_class)
+    ),
+    bind_cols(
+      color_space = color_space,
+      model = model_name,
+      dataset = "holdout",
+      threshold = holdout_threshold,
+      sens(predict_at_threshold(model, holdout, holdout_threshold), truth = BT, estimate = .pred_class)
+    )
+  )
+}
+```
+
+```{r metrics get}
+metrics_at_threshold <- bind_rows(
+  # RGB Models
+  calculate_metrics_at_threshold(
+    final_logreg_rgb_fit, train_data, holdout_data,
+    "Logistic Regression", "RGB",
+    logreg_rgb_train_threshold, logreg_rgb_holdout_threshold
+  ),
+  calculate_metrics_at_threshold(
+    final_lda_rgb_fit, train_data, holdout_data,
+    "LDA", "RGB",
+    lda_rgb_train_threshold, lda_rgb_holdout_threshold
+  ),
+  calculate_metrics_at_threshold(
+    final_qda_rgb_fit, train_data, holdout_data,
+    "QDA", "RGB",
+    qda_rgb_train_threshold, qda_rgb_holdout_threshold
+  ),
+  
+  # CIELab Models
+  calculate_metrics_at_threshold(
+    final_logreg_lab_fit, train_data, holdout_data,
+    "Logistic Regression", "CIELab",
+    logreg_lab_train_threshold, logreg_lab_holdout_threshold
+  ),
+  calculate_metrics_at_threshold(
+    final_lda_lab_fit, train_data, holdout_data,
+    "LDA", "CIELab",
+    lda_lab_train_threshold, lda_lab_holdout_threshold
+  ),
+  calculate_metrics_at_threshold(
+    final_qda_lab_fit, train_data, holdout_data,
+    "QDA", "CIELab",
+    qda_lab_train_threshold, qda_lab_holdout_threshold
+  ),
+  
+  # HSV Models
+  calculate_metrics_at_threshold(
+    final_logreg_hsv_fit, train_data, holdout_data,
+    "Logistic Regression", "HSV",
+    logreg_hsv_train_threshold, logreg_hsv_holdout_threshold
+  ),
+  calculate_metrics_at_threshold(
+    final_lda_hsv_fit, train_data, holdout_data,
+    "LDA", "HSV",
+    lda_hsv_train_threshold, lda_hsv_holdout_threshold
+  ),
+  calculate_metrics_at_threshold(
+    final_qda_hsv_fit, train_data, holdout_data,
+    "QDA", "HSV",
+    qda_hsv_train_threshold, qda_hsv_holdout_threshold
+  )
+) %>%
+  arrange(dataset, color_space, model)
+```
+
+Once the optimal threshold is found on the holdout set, the final metrics are computed for both the training and holdout data using the optimal threshold determined in previous steps, allowing a direct comparison of how well each model transfers its learned classifications to unseen examples.
+
+The table of performance metrics at the chosen thresholds to optimize f-measure demonstrates the final trade-offs each model achieves in terms of accuracy, F-measure, precision, and sensitivity for both the training and holdout sets. By examining these values, we can better understand the likely field performance of each model–color space combination.
+
+#### Final Holdout F-Measure Results
+
+The table below summarizes the F-measure on the holdout set for each model–color space pair, along with each pair’s chosen threshold optimized for F-measure.
+
+- Logistic Regression (RGB) achieves the highest F-measure at 0.912 (threshold = 0.99).
+- Logistic Regression (CIELab) follows closely at 0.907 (threshold = 0.99).
+- QDA (RGB) and LDA (CIELab) have moderate F-measure values of 0.714 and 0.791, respectively.
+- Most HSV models show notably lower F-measure, suggesting less effective balancing of precision and recall at their respective optimal thresholds.
+
+The results indicate that the optimal threshold on the holdout data is considerably higher than on the training data. This is intuitive because, on unseen data, the model must be much more certain that a pixel is a blue tarp before assigning it a positive classification; the training data primarily defines the color profiles, while the holdout data requires a more conservative decision rule.
+
+Overall, logistic regression in RGB or CIELab provides the strongest combination of detecting actual blue tarps and minimizing false positives. This is crucial for rapid response and efficient resource deployment, as each false alarm requires manual verification and each missed blue tarp is potentially a missed person or family in need of aid.
+
+```{r model eval table}
+metrics_at_threshold <- metrics_at_threshold %>%
+  mutate(
+    dataset = factor(dataset, levels = c("train", "holdout")),
+    color_space = factor(color_space, levels = c("RGB", "CIELab", "HSV")),
+    model = factor(model, levels = c("Logistic Regression", "LDA", "QDA"))
+  ) %>%
+  tidyr::pivot_wider(names_from = .metric, values_from = .estimate) %>%
+  select(
+    dataset, color_space, model, threshold, 
+    accuracy, roc_auc, sens, f_meas
+  ) %>%
+  arrange(dataset, color_space, model, threshold) %>%
+  knitr::kable(
+    caption = "Final metrics for models at chosen thresholds.",
+    digits = 3
+  ) %>%
+  kableExtra::kable_styling(full_width = FALSE) %>%
+  kableExtra::collapse_rows(columns = 1:2, valign = "top")
+
+metrics_at_threshold
+
+save_kable(metrics_at_threshold, file = "metrics_at_threshold.png", zoom = 2)
+```
+
+#### Confusion Matrices on the Holdout Set
+
+The figures below show the confusion matrices for each model–color space pair on the holdout set, evaluated at their respective F-measure–optimized thresholds. Each matrix indicates how many pixels were predicted as blue tarps and how many were actually blue tarps (`BT = TRUE`) versus not blue tarps (`BT = FALSE`).
+
+A desirable matrix has high counts along the top-left to bottom-right diagonal, indicating correct classifications. The top-right entry in each matrix (false positives) corresponds to precision: fewer false positives means a higher precision. The bottom-left entry (false negatives) corresponds to recall: fewer missed blue tarps means higher recall.
+
+In RGB and CIELab, logistic regression shows a balanced trade-off between precision and recall, resulting in relatively low false positives and few missed detections. This balance is essential for real-world deployments where each false positive demands field checks or additional remote-sensing analysis, while each missed tarp undermines the humanitarian response. The confusion matrices confirm that these two configurations (logistic regression in RGB or CIELab) provide strong overall performance at their ideal thresholds.
+
+```{r conf matrix plots}
+# Function to generate confusion matrix plots
+visualize_conf_mat_holdout <- function(model, data, threshold, metric_label) {
+  cm <- model %>%
+    augment(data) %>%
+    mutate(.pred_class = make_two_class_pred(.pred_TRUE, c("TRUE", "FALSE"), threshold = threshold)) %>%
+    conf_mat(truth = BT, estimate = .pred_class)
+  
+  autoplot(cm, type = "heatmap") +
+    labs(title = sprintf("Threshold %.3f (%s)", threshold, metric_label))
+}
+
+# Function to generate overview confusion matrix plots
+overview_model_holdout <- function(model, model_name, threshold) {
+  cm_plot <- visualize_conf_mat_holdout(model, holdout_data, threshold, "Holdout")
+  cm_plot + labs(title = sprintf("%s \n (Threshold = %.3f)", model_name, threshold))
+}
+
+## RGB Models
+logreg_cm_rgb <- overview_model_holdout(final_logreg_rgb_fit, "Logistic Regression (RGB)", logreg_rgb_holdout_threshold)
+lda_cm_rgb    <- overview_model_holdout(final_lda_rgb_fit, "LDA (RGB)", lda_rgb_holdout_threshold)
+qda_cm_rgb    <- overview_model_holdout(final_qda_rgb_fit, "QDA (RGB)", qda_rgb_holdout_threshold)
+
+## CIELab Models
+logreg_cm_lab <- overview_model_holdout(final_logreg_lab_fit, "Logistic Regression (CIELab)", logreg_lab_holdout_threshold)
+lda_cm_lab    <- overview_model_holdout(final_lda_lab_fit, "LDA (CIELab)", lda_lab_holdout_threshold)
+qda_cm_lab    <- overview_model_holdout(final_qda_lab_fit, "QDA (CIELab)", qda_lab_holdout_threshold)
+
+## HSV Models
+logreg_cm_hsv <- overview_model_holdout(final_logreg_hsv_fit, "Logistic Regression (HSV)", logreg_hsv_holdout_threshold)
+lda_cm_hsv    <- overview_model_holdout(final_lda_hsv_fit, "LDA (HSV)", lda_hsv_holdout_threshold)
+qda_cm_hsv    <- overview_model_holdout(final_qda_hsv_fit, "QDA (HSV)", qda_hsv_holdout_threshold)
+```
+
+```{r show conf matrix plots}
+#| fig.width: 12
+#| fig.height: 9
+#| fig.cap: Holdout Set Confusion Matrices by Color Space
+#| warning: FALSE
+# Combine plots into a 3-row
+combined_cm <- (logreg_cm_rgb + lda_cm_rgb + qda_cm_rgb) /
+               (logreg_cm_lab + lda_cm_lab + qda_cm_lab) /
+               (logreg_cm_hsv + lda_cm_hsv + qda_cm_hsv) +
+               plot_annotation(title = "Holdout Set Confusion Matrices Across Color Spaces")
+
+# Display the combined plot
+combined_cm
+
+ggsave("combined_cm.png", plot = combined_cm, width = 12, height = 9, dpi = 600)
+```
+
+#### Threshold Fine-Tuning
+
+In our initial threshold search with increments of 0.01, the optimal thresholds for the two best models (logistic regression in RGB and CIELab) reached 0.99, the upper limit of the search range. To assess whether a more precise threshold could further improve performance, we conducted a refined search over the interval [0.99, 1] in increments of 0.001. This finer scan allows us to determine if a marginal increase in the threshold yields a significant improvement in the F-measure.
+
+We implement this fine threshold search for the logistic regression models in RGB and CIELab. We then extract the optimal thresholds and compute performance metrics at these refined thresholds.
+
+```{r optimal thresholds fine}
+# Find optimal thresholds
+threshold_fine_scan <- function(model, data, model_name) {
+  threshold_data <- model %>%
+    augment(data) %>%
+    probably::threshold_perf(
+      truth = BT,
+      estimate = .pred_TRUE,
+      thresholds = seq(0.99, 1, 0.001),
+      event_level = "first",
+      metrics = metric_set(f_meas)
+    )
+  opt_threshold <- threshold_data %>%
+    drop_na() %>%
+    arrange(desc(.estimate)) %>%
+    slice(1)
+  list(
+    threshold = opt_threshold$.threshold,
+    threshold_data = threshold_data,
+    opt_threshold = opt_threshold,
+    model_name = model_name
+  )
+}
+```
+
+```{r get opt thresholds fine}
+#| warning: FALSE
+#| message: FALSE
+# Threshold scanning
+logreg_rgb_fine_result <- threshold_fine_scan(final_logreg_rgb_fit, holdout_data, "Logistic Regression (RGB)")
+
+logreg_lab_fine_result <- threshold_fine_scan(final_logreg_lab_fit, holdout_data, "Logistic Regression (CIELab)")
+```
+
+```{r save opt thresholds fine}
+# Optimal thresholds
+logreg_rgb_fine_holdout_threshold <- logreg_rgb_fine_result$threshold
+
+logreg_lab_fine_holdout_threshold <- logreg_lab_fine_result$threshold
+```
+
+```{r metric opt thres fine}
+metrics_at_fine_threshold <- bind_rows(
+  # RGB Models
+  calculate_metrics_at_threshold(
+    final_logreg_rgb_fit, train_data, holdout_data,
+    "Logistic Regression", "RGB",
+    logreg_rgb_train_threshold, logreg_rgb_fine_holdout_threshold
+  ),
+  # CIELab Models
+  calculate_metrics_at_threshold(
+    final_logreg_lab_fit, train_data, holdout_data,
+    "Logistic Regression", "CIELab",
+    logreg_lab_train_threshold, logreg_lab_fine_holdout_threshold
+  )
+) %>% arrange(dataset)
+```
+
+#### Analysis of Fine-Tuned Threshold Performance
+
+The refined threshold scan—from 0.99 to 1 in 0.001 increments—shows that the logistic regression model using the CIELab color space achieves a slightly higher F-measure at its optimal threshold than the corresponding RGB model. Although the performance differences are marginal, this suggests that the CIELab representation may capture subtle variations in blue tarp appearance more effectively than RGB. Overall, however, the two models are very similar in performance.
+
+```{r model eval table fine}
+metrics_at_fine_threshold <- metrics_at_fine_threshold %>%
+  mutate(
+    dataset = factor(dataset, levels = c("train", "holdout")),
+    color_space = factor(color_space, levels = c("RGB", "CIELab", "HSV")),
+    model = factor(model, levels = c("Logistic Regression", "LDA", "QDA"))
+  ) %>%
+  tidyr::pivot_wider(names_from = .metric, values_from = .estimate) %>%
+  select(dataset, color_space, model, threshold, accuracy, roc_auc, sens, f_meas) %>%
+  arrange(dataset, color_space, model, threshold) %>%
+  knitr::kable(
+    caption = "Performance metrics for models at ideal threshold (fine tuning).",
+    digits = 3
+  ) %>%
+  kableExtra::kable_styling(full_width = FALSE) %>%
+  kableExtra::collapse_rows(columns = 1:2, valign = "top")
+
+metrics_at_fine_threshold
+
+save_kable(metrics_at_fine_threshold, file = "metrics_at_fine_threshold.png", zoom = 2)
+```
+
+#### Final Confusion Matrix Analysis
+
+The final confusion matrices indicate that, to achieve a slightly improved F-measure, the logistic regression model in the CIELab color space produces 95 fewer false positives compared to its RGB counterpart. However, this gain is accompanied by an increase of 19 false negatives (i.e. 976 versus 957 missed blue tarps). Although these differences are numerically small, each misclassification corresponds to a pixel that may have significant real-world implications for blue tarp detection in humanitarian aid applications.
+
+```{r final conf matrix fine}
+logreg_cm_rgb <- overview_model_holdout(final_logreg_rgb_fit, "Logistic Regression (RGB)", logreg_rgb_fine_holdout_threshold)
+logreg_cm_lab <- overview_model_holdout(final_logreg_lab_fit, "Logistic Regression (CIELab)", logreg_lab_fine_holdout_threshold)
+
+# Combine
+combined_cm_fine <- logreg_cm_rgb + logreg_cm_lab +
+  plot_annotation(title = "Holdout Set Confusion Matrices for Finely Tuned Models (RGB and CIELab)")
+
+combined_cm_fine
+
+ggsave("combined_cm_fine.png", plot = combined_cm_fine, width = 9, height = 4, dpi = 600)
+```
+
+### Smoothing
+
+```{r predict to raster}
+# Function to predict class
+predict_at_threshold_raster <- function(model, data, threshold) {
+  predictions <- model %>%
+    augment(data) %>%
+    mutate(.pred_class = make_two_class_pred(.pred_TRUE, c("TRUE", "FALSE"), threshold = threshold))
+  return(predictions)
+}
+
+# Apply model preds
+logreg_rgb_predictions <- predict_at_threshold_raster(final_logreg_rgb_fit, holdout_data, logreg_rgb_fine_holdout_threshold)
+logreg_lab_predictions <- predict_at_threshold_raster(final_logreg_lab_fit, holdout_data, logreg_lab_fine_holdout_threshold)
+```
+
+```{r predict to raster 2}
+# Convert to spatial vector
+logreg_rgb_vect <- vect(logreg_rgb_predictions, geom = c("Map X", "Map Y"), crs = "EPSG:32618")
+logreg_lab_vect <- vect(logreg_lab_predictions, geom = c("Map X", "Map Y"), crs = "EPSG:32618")
+
+# Reproject to UTM
+logreg_rgb_utm <- project(logreg_rgb_vect, "EPSG:32618")
+logreg_lab_utm <- project(logreg_lab_vect, "EPSG:32618")
+```
+
+```{r convert raster class}
+# Create empty raster
+raster_template <- rast(ext(logreg_rgb_utm), resolution = 0.08, crs = "EPSG:32618")
+
+# Rasterize 
+r_rgb <- rasterize(logreg_rgb_utm, raster_template, field = ".pred_class")
+r_lab <- rasterize(logreg_lab_utm, raster_template, field = ".pred_class")
+
+# Convert to integer
+r_rgb <- round(r_rgb)
+r_lab <- round(r_lab)
+```
+
+```{r moving window 3}
+# 3×3 moving window
+window_size <- matrix(1, nrow = 3, ncol = 3)
+
+# Apply focal mode filtering with NA treated as 0, but only computing for non-NA cells
+smoothed_rgb <- focal(r_rgb, w = window_size, fun = modal, na.policy = "omit", fillvalue = 0)
+smoothed_lab <- focal(r_lab, w = window_size, fun = modal, na.policy = "omit", fillvalue = 0)
+```
+
+```{r moving window 5}
+# 3×3 moving window
+window_size <- matrix(1, nrow = 5, ncol = 5)
+
+# Apply focal mode filtering with NA treated as 0, but only computing for non-NA cells
+smoothed_rgb_5 <- focal(r_rgb, w = window_size, fun = modal, na.policy = "omit", fillvalue = 0)
+smoothed_lab_5 <- focal(r_lab, w = window_size, fun = modal, na.policy = "omit", fillvalue = 0)
+```
+
+```{r smoothed df 3}
+convert_smoothed_to_df <- function(smoothed_raster, holdout_data) {
+  # Convert to terra
+  holdout_vect <- terra::vect(holdout_data, geom = c("Lon", "Lat"), crs = "EPSG:4326")
+  
+  # Reproject
+  holdout_vect_utm <- terra::project(holdout_vect, crs(smoothed_raster))
+
+  # Extract raster values
+  extracted_values <- terra::extract(smoothed_raster, holdout_vect_utm, ID = FALSE)
+
+  # .pred_class
+  results <- holdout_data %>%
+    mutate(
+      .pred_class = factor(
+        extracted_values[, 1],
+        levels = c(1, 0),
+        labels = c("TRUE", "FALSE")
+      )
+    ) %>%
+    drop_na()
+  
+  return(results)
+}
+
+# Apply function
+smoothed_rgb_df <- convert_smoothed_to_df(smoothed_rgb, holdout_data)
+smoothed_lab_df <- convert_smoothed_to_df(smoothed_lab, holdout_data)
+```
+
+```{r smoothed df 5}
+convert_smoothed_to_df <- function(smoothed_raster, holdout_data) {
+  # Convert to terra
+  holdout_vect <- terra::vect(holdout_data, geom = c("Lon", "Lat"), crs = "EPSG:4326")
+  
+  # Reproject
+  holdout_vect_utm <- terra::project(holdout_vect, crs(smoothed_raster))
+
+  # Extract raster values
+  extracted_values <- terra::extract(smoothed_raster, holdout_vect_utm, ID = FALSE)
+
+  # .pred_class
+  results <- holdout_data %>%
+    mutate(
+      .pred_class = factor(
+        extracted_values[, 1],
+        levels = c(1, 0),
+        labels = c("TRUE", "FALSE")
+      )
+    ) %>%
+    drop_na()
+  
+  return(results)
+}
+
+# Apply function
+smoothed_rgb_df_5 <- convert_smoothed_to_df(smoothed_rgb_5, holdout_data)
+smoothed_lab_df_5 <- convert_smoothed_to_df(smoothed_lab_5, holdout_data)
+```
+
+```{r get preds of smoothed3 }
+# Function for smoothed preds
+evaluate_smoothed_predictions <- function(smoothed_df, model_name, color_space) {
+  f_meas_score <- f_meas(smoothed_df, truth = BT, estimate = .pred_class)
+  
+  tibble(
+    color_space = color_space,
+    model = model_name,
+    f_meas = f_meas_score$.estimate
+  )
+}
+
+# Compute F-measure
+smoothed_metrics <- bind_rows(
+  evaluate_smoothed_predictions(smoothed_rgb_df, "Logistic Regression", "RGB"),
+  evaluate_smoothed_predictions(smoothed_lab_df, "Logistic Regression", "CIELab")
+)
+
+# Display
+smoothed_metrics <- smoothed_metrics %>%
+  knitr::kable(
+    caption = "F-Measure for Smoothed Predictions (RGB & CIELab)",
+    digits = 4
+  ) %>%
+  kableExtra::kable_styling(full_width = FALSE)
+
+smoothed_metrics
+
+save_kable(smoothed_metrics, file = "smoothed_metrics.png", zoom = 2)
+```
+
+```{r get preds of smoothed 5}
+# Function for smoothed preds
+evaluate_smoothed_predictions <- function(smoothed_df, model_name, color_space) {
+  f_meas_score <- f_meas(smoothed_df, truth = BT, estimate = .pred_class)
+  
+  tibble(
+    color_space = color_space,
+    model = model_name,
+    f_meas = f_meas_score$.estimate
+  )
+}
+
+# Compute F-measure
+smoothed_metrics_5 <- bind_rows(
+  evaluate_smoothed_predictions(smoothed_rgb_df_5, "Logistic Regression", "RGB"),
+  evaluate_smoothed_predictions(smoothed_lab_df_5, "Logistic Regression", "CIELab")
+)
+
+# Display
+smoothed_metrics_5 <- smoothed_metrics_5 %>%
+  knitr::kable(
+    caption = "F-Measure for Smoothed Predictions (RGB & CIELab)",
+    digits = 4
+  ) %>%
+  kableExtra::kable_styling(full_width = FALSE)
+
+smoothed_metrics_5
+
+save_kable(smoothed_metrics_5, file = "smoothed_metrics_5.png", zoom = 2)
+```
+
+```{r smoothed conf mats 3}
+# Function of conf mats
+visualize_conf_mat_smoothed <- function(smoothed_df, model_name, color_space) {
+  cm <- conf_mat(smoothed_df, truth = BT, estimate = .pred_class)
+  
+  autoplot(cm, type = "heatmap") +
+    labs(title = sprintf("%s (%s) \nSmoothed", model_name, color_space))
+}
+
+# Generate
+logreg_cm_rgb_smoothed <- visualize_conf_mat_smoothed(smoothed_rgb_df, "Logistic Regression", "RGB")
+logreg_cm_lab_smoothed <- visualize_conf_mat_smoothed(smoothed_lab_df, "Logistic Regression", "CIELab")
+
+# Combine
+combined_cm_smoothed <- logreg_cm_rgb_smoothed + logreg_cm_lab_smoothed +
+  plot_annotation(title = "Holdout Set Confusion Matrices for Smoothed Predictions")
+
+combined_cm_smoothed
+
+ggsave("combined_cm_smoothed.png", plot = combined_cm_smoothed, width = 9, height = 4, dpi = 600)
+```
+
+```{r smoothed conf mats 5}
+# Function of conf mats
+visualize_conf_mat_smoothed <- function(smoothed_df, model_name, color_space) {
+  cm <- conf_mat(smoothed_df, truth = BT, estimate = .pred_class)
+  
+  autoplot(cm, type = "heatmap") +
+    labs(title = sprintf("%s (%s) \nSmoothed", model_name, color_space))
+}
+
+# Generate
+logreg_cm_rgb_smoothed_5 <- visualize_conf_mat_smoothed(smoothed_rgb_df_5, "Logistic Regression", "RGB")
+logreg_cm_lab_smoothed_5 <- visualize_conf_mat_smoothed(smoothed_lab_df_5, "Logistic Regression", "CIELab")
+
+# Combine
+combined_cm_smoothed_5 <- logreg_cm_rgb_smoothed_5 + logreg_cm_lab_smoothed_5 +
+  plot_annotation(title = "Holdout Set Confusion Matrices for Smoothed Predictions")
+
+combined_cm_smoothed_5
+
+ggsave("combined_cm_smoothed_5.png", plot = combined_cm_smoothed_5, width = 9, height = 4, dpi = 600)
+```
+
+```{r example smoothing}
+m <- matrix(sample(c(0, 1), 81, replace = TRUE, prob = c(0.6, 0.4)), nrow = 9, ncol = 9)
+r <- rast(m)
+
+window_size <- matrix(1, nrow = 3, ncol = 3)
+r_smoothed <- focal(r, w = window_size, fun = modal, na.policy = "omit", fillvalue = 0)
+
+df_original <- as.data.frame(r, xy = TRUE)
+df_smoothed <- as.data.frame(r_smoothed, xy = TRUE)
+
+colnames(df_original)[3] <- "class"
+colnames(df_smoothed)[3] <- "class"
+
+# Plot orig
+p1 <- ggplot(df_original, aes(x = x, y = y, fill = factor(class))) +
+  geom_tile(color = "black") +
+  scale_fill_manual(values = c("darkgray", "lightblue"), name = "Class") +
+  labs(title = "Original Classification") +
+  coord_fixed() +
+  theme_minimal()
+
+# Plot smooth
+p2 <- ggplot(df_smoothed, aes(x = x, y = y, fill = factor(class))) +
+  geom_tile(color = "black") +
+  scale_fill_manual(values = c("darkgray", "lightblue"), name = "Class") +
+  labs(title = "Smoothed Classification") +
+  coord_fixed() +
+  theme_minimal()
+
+# Combine 
+combined_plot <- p1 + p2 + plot_layout(ncol = 2)
+combined_plot
+```
+
+### Clustering Analysis
+
+```{r clustering analysis}
+predict_at_threshold_raster <- function(model, data) {
+  predictions <- model %>%
+    augment(data) %>%
+    select(`Map X`, `Map Y`, .pred_TRUE)
+  return(predictions)
+}
+
+# Apply predictions
+logreg_rgb_predictions <- predict_at_threshold_raster(final_logreg_rgb_fit, holdout_data)
+logreg_lab_predictions <- predict_at_threshold_raster(final_logreg_lab_fit, holdout_data)
+
+# Convert to spatial vector
+logreg_rgb_vect <- vect(logreg_rgb_predictions, geom = c("Map X", "Map Y"), crs = "EPSG:32618")
+logreg_lab_vect <- vect(logreg_lab_predictions, geom = c("Map X", "Map Y"), crs = "EPSG:32618")
+
+# Create empty raster
+raster_template <- rast(ext(logreg_rgb_vect), resolution = 0.08, crs = "EPSG:32618")
+
+# Rasterize the .pred_TRUE column
+r_pred_rgb <- rasterize(logreg_rgb_vect, raster_template, field = ".pred_TRUE")
+r_pred_lab <- rasterize(logreg_lab_vect, raster_template, field = ".pred_TRUE")
+
+window_size <- matrix(1, nrow = 3, ncol = 3)
+
+r_local_mean_rgb <- focal(r_pred_rgb, w = window_size, fun = mean, na.policy = "omit")
+r_local_mean_lab <- focal(r_pred_lab, w = window_size, fun = mean, na.policy = "omit")
+
+r_diff_rgb <- abs(r_pred_rgb - r_local_mean_rgb)
+r_diff_lab <- abs(r_pred_lab - r_local_mean_lab)
+```
+
+```{r clustering plot}
+convert_clustering_to_df <- function(r_pred, r_diff, holdout_data) {
+  holdout_vect <- terra::vect(holdout_data, geom = c("Map X", "Map Y"), crs = "EPSG:32618")
+  
+  pred_values <- terra::extract(r_pred, holdout_vect, ID = FALSE)
+  diff_values <- terra::extract(r_diff, holdout_vect, ID = FALSE)
+  
+  results <- holdout_data %>%
+    mutate(
+      pred_TRUE = pred_values[, 1],
+      clustering_metric = diff_values[, 1]
+    ) %>%
+    drop_na()
+  
+  return(results)
+}
+
+# Apply function to extract values for RGB and CIELab
+holdout_data_clustering_rgb <- convert_clustering_to_df(r_pred_rgb, r_diff_rgb, holdout_data)
+holdout_data_clustering_lab <- convert_clustering_to_df(r_pred_lab, r_diff_lab, holdout_data)
+
+
+ggplot(holdout_data_clustering_rgb, aes(x = pred_TRUE, y = clustering_metric)) +
+  geom_point(alpha = 0.3) +
+  geom_smooth(method = "lm", color = "red", se = FALSE) +
+  labs(
+    x = "Prediction Probability (.pred_TRUE)",
+    y = "Clustering Measure (Local Mean Difference)",
+    title = "Clustering Analysis of Prediction Probabilities (RGB)"
+  ) +
+  theme_minimal()
+
+ggplot(holdout_data_clustering_lab, aes(x = pred_TRUE, y = clustering_metric)) +
+  geom_point(alpha = 0.3) +
+  geom_smooth(method = "lm", color = "red", se = FALSE) +
+  labs(
+    x = "Prediction Probability (.pred_TRUE)",
+    y = "Clustering Measure (Local Mean Difference)",
+    title = "Clustering Analysis of Prediction Probabilities (CIELab)"
+  ) +
+  theme_minimal()
+```
+
+### Spatial autocorrelation plot
+
+```{r spatial autocorr window}
+# Define a 3x3 moving window (all weights = 1)
+w <- matrix(1, nrow = 3, ncol = 3)
+
+# Compute local means for each band separately using the first band of the rgb_raster
+local_mean_red   <- focal(rgb_raster[[1]], w = w, fun = mean, na.rm = TRUE)
+local_mean_green <- focal(rgb_raster[[2]], w = w, fun = mean, na.rm = TRUE)
+local_mean_blue  <- focal(rgb_raster[[3]], w = w, fun = mean, na.rm = TRUE)
+
+diff_euclidean <- sqrt((rgb_raster[[1]] - local_mean_red)^2 +
+                       (rgb_raster[[2]] - local_mean_green)^2 +
+                       (rgb_raster[[3]] - local_mean_blue)^2)
+```
+
+```{r spatial autocorr plot}
+convert_diff_to_df <- function(diff_raster, holdout_data) {
+  holdout_vect <- terra::vect(holdout_data, geom = c("Map X", "Map Y"), crs = "EPSG:32618")
+  
+  diff_values <- terra::extract(diff_raster, holdout_vect, ID = FALSE)
+  
+  results <- holdout_data %>%
+    mutate(local_diff = diff_values[, 1]) %>%
+    drop_na()
+  
+  return(results)
+}
+
+df_diff <- convert_diff_to_df(diff_euclidean, holdout_data)
+```
+
+```{r random autocorr raster}
+holdout_data_random <- holdout_data
+n <- nrow(holdout_data_random)
+perm <- sample(n)
+holdout_data_random$`Map X` <- holdout_data$`Map X`[perm]
+holdout_data_random$`Map Y` <- holdout_data$`Map Y`[perm]
+
+v_random <- terra::vect(holdout_data_random, geom = c("Map X", "Map Y"), crs = "EPSG:32618")
+
+r_empty_random <- terra::rast(terra::ext(v_random), resolution = 0.08, crs = "EPSG:32618")
+
+r_b1_random <- terra::rasterize(v_random, r_empty_random, field = "Red", overwrite = TRUE)
+r_b2_random <- terra::rasterize(v_random, r_empty_random, field = "Green", overwrite = TRUE)
+r_b3_random <- terra::rasterize(v_random, r_empty_random, field = "Blue", overwrite = TRUE)
+
+rgb_raster_random <- c(r_b1_random, r_b2_random, r_b3_random)
+
+w <- matrix(1, nrow = 3, ncol = 3)
+
+local_mean_red_random   <- focal(rgb_raster_random[[1]], w = w, fun = mean, na.rm = TRUE)
+local_mean_green_random <- focal(rgb_raster_random[[2]], w = w, fun = mean, na.rm = TRUE)
+local_mean_blue_random  <- focal(rgb_raster_random[[3]], w = w, fun = mean, na.rm = TRUE)
+
+diff_red_random   <- rgb_raster_random[[1]] - local_mean_red_random
+diff_green_random <- rgb_raster_random[[2]] - local_mean_green_random
+diff_blue_random  <- rgb_raster_random[[3]] - local_mean_blue_random
+
+diff_euclidean_random <- sqrt(diff_red_random^2 + diff_green_random^2 + diff_blue_random^2)
+```
+
+```{r convert random back to df}
+convert_diff_to_df_random <- function(diff_raster, holdout_data) {
+  holdout_vect <- terra::vect(holdout_data, geom = c("Map X", "Map Y"), crs = "EPSG:32618")
+  
+  diff_values <- terra::extract(diff_raster, holdout_vect, ID = FALSE)
+  
+  results <- holdout_data %>%
+    mutate(local_diff_random = diff_values[, 1]) %>%
+    drop_na()
+  
+  return(results)
+}
+
+df_diff_random <- convert_diff_to_df_random(diff_euclidean_random, holdout_data)
+```
+
+```{r autocorr plot combine dfs}
+df_diff <- df_diff %>% rename(local_diff = local_diff)
+df_diff_random <- df_diff_random %>% rename(local_diff = local_diff_random)
+
+df_diff <- df_diff %>% mutate(group = "Original")
+df_diff_random <- df_diff_random %>% mutate(group = "Randomized")
+
+combined_df <- bind_rows(df_diff, df_diff_random)
+```
+
+```{r show autocorrplot}
+combined_df_filtered <- combined_df %>%
+  group_by(group) %>%
+  filter(local_diff <= quantile(local_diff, 0.80, na.rm = TRUE)) %>%
+  ungroup()
+
+# Create a box plot 
+ggplot(combined_df_filtered, aes(x = group, y = local_diff, fill = group)) +
+  geom_boxplot(alpha = 0.7) +
+  labs(
+    title = "Comparison of Local Euclidean Differences\n(Original vs. Randomized Spatial Arrangement)",
+    x = "Data Type",
+    y = "Euclidean Difference from Local Mean"
+  ) +
+  theme_minimal() +
+  scale_fill_manual(values = c("blue", "red"))
+```
+
+```{r stop cluster}
+stopCluster(cl)
+registerDoSEQ()
+```
